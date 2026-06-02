@@ -1,0 +1,21 @@
+# Bot & API
+aiogram==3.7.0
+fastapi==0.111.0
+uvicorn==0.30.1
+
+# Database — async stack
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+
+# Blockchain
+web3==6.19.0
+aiohttp==3.9.5
+httpx==0.27.0
+
+# Exchanges
+ccxt==4.3.44
+
+# Utilities
+python-dotenv==1.0.1
+cryptography==42.0.8
+apscheduler==3.10.4

@@ -1,0 +1,104 @@
+"""
+services/wallets.py — multi-chain balance fetching with per-call timeouts
+"""
+import asyncio
+import aiohttp
+from web3 import Web3
+import config
+
+CHAIN_CONFIG: dict[str, dict] = {
+    "ethereum": {"rpc": config.ETH_RPC_URL,      "symbol": "ETH",  "type": "evm",     "label": "Ethereum",  "emoji": "⟠"},
+    "bnb":      {"rpc": config.BNB_RPC_URL,       "symbol": "BNB",  "type": "evm",     "label": "BNB Chain", "emoji": "🟡"},
+    "polygon":  {"rpc": config.POLYGON_RPC_URL,   "symbol": "POL",  "type": "evm",     "label": "Polygon",   "emoji": "🟣"},
+    "arbitrum": {"rpc": config.ARBITRUM_RPC_URL,  "symbol": "ETH",  "type": "evm",     "label": "Arbitrum",  "emoji": "🔵"},
+    "optimism": {"rpc": config.OPTIMISM_RPC_URL,  "symbol": "ETH",  "type": "evm",     "label": "Optimism",  "emoji": "🔴"},
+    "base":     {"rpc": config.BASE_RPC_URL,       "symbol": "ETH",  "type": "evm",     "label": "Base",      "emoji": "🔷"},
+    "avalanche":{"rpc": config.AVAX_RPC_URL,       "symbol": "AVAX", "type": "evm",     "label": "Avalanche", "emoji": "🔺"},
+    "solana":   {"rpc": config.SOLANA_RPC_URL,     "symbol": "SOL",  "type": "solana",  "label": "Solana",    "emoji": "◎"},
+    "bitcoin":  {"rpc": config.BITCOIN_API_URL,    "symbol": "BTC",  "type": "bitcoin", "label": "Bitcoin",   "emoji": "₿"},
+}
+
+CHAIN_SYMBOL = {k: v["symbol"] for k, v in CHAIN_CONFIG.items()}
+EVM_CHAINS   = [k for k, v in CHAIN_CONFIG.items() if v["type"] == "evm"]
+
+# Per-chain RPC timeout in seconds
+RPC_TIMEOUT = 8
+
+
+def detect_address_type(address: str) -> str:
+    address = address.strip()
+    if address.startswith("0x") and len(address) == 42:
+        return "evm"
+    if address.startswith("bc1") or (len(address) in range(25, 36) and address[0] in "13"):
+        return "bitcoin"
+    if 32 <= len(address) <= 44 and not address.startswith("0x"):
+        return "solana"
+    return "unknown"
+
+
+async def _get_evm_balance(rpc_url: str, address: str) -> float:
+    loop = asyncio.get_event_loop()
+    def _fetch():
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": RPC_TIMEOUT}))
+        checksum = Web3.to_checksum_address(address)
+        wei = w3.eth.get_balance(checksum)
+        return float(Web3.from_wei(wei, "ether"))
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, _fetch),
+        timeout=RPC_TIMEOUT + 2,
+    )
+
+
+async def _get_sol_balance(rpc_url: str, address: str) -> float:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address]}
+    timeout = aiohttp.ClientTimeout(total=RPC_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(rpc_url, json=payload) as resp:
+            data = await resp.json()
+    return data["result"]["value"] / 1_000_000_000
+
+
+async def _get_btc_balance(api_url: str, address: str) -> float:
+    url = f"{api_url}/address/{address}"
+    timeout = aiohttp.ClientTimeout(total=RPC_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            if resp.status == 400:
+                raise ValueError(f"Invalid Bitcoin address: {address}")
+            data = await resp.json()
+    stats    = data.get("chain_stats", {})
+    satoshis = stats.get("funded_txo_sum", 0) - stats.get("spent_txo_sum", 0)
+    return satoshis / 100_000_000
+
+
+async def get_wallet_balance(chain: str, address: str) -> dict:
+    cfg = CHAIN_CONFIG.get(chain.lower())
+    if not cfg:
+        return {"chain": chain, "symbol": "?", "address": address,
+                "balance": 0.0, "error": f"Unsupported chain: {chain}", "label": None}
+    try:
+        if cfg["type"] == "evm":
+            balance = await _get_evm_balance(cfg["rpc"], address)
+        elif cfg["type"] == "solana":
+            balance = await _get_sol_balance(cfg["rpc"], address)
+        elif cfg["type"] == "bitcoin":
+            balance = await _get_btc_balance(cfg["rpc"], address)
+        else:
+            raise ValueError(f"Unknown type: {cfg['type']}")
+        return {"chain": chain, "symbol": cfg["symbol"], "address": address,
+                "balance": balance, "error": None, "label": cfg["label"]}
+    except asyncio.TimeoutError:
+        return {"chain": chain, "symbol": cfg["symbol"], "address": address,
+                "balance": 0.0, "error": "RPC timed out", "label": cfg["label"]}
+    except Exception as exc:
+        return {"chain": chain, "symbol": cfg["symbol"], "address": address,
+                "balance": 0.0, "error": str(exc)[:100], "label": cfg["label"]}
+
+
+async def get_all_wallet_balances(wallets: list[dict]) -> list[dict]:
+    """Fetch all wallets concurrently — each has its own timeout so one can't block others."""
+    tasks   = [get_wallet_balance(w["chain"], w["address"]) for w in wallets]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    for result, wallet in zip(results, wallets):
+        result["label"] = wallet.get("label") or result.get("label")
+    return list(results)
