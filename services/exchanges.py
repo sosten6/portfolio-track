@@ -1,19 +1,10 @@
 """
-services/exchanges.py
-─────────────────────
-Fetches balances from exchanges via CCXT.
-
-Binance sub-accounts fetched:
-  spot+earn  — spot wallet + LD* flexible earn (single call, no deprecated endpoint)
-  funding    — funding/payment wallet
-  margin     — cross margin (skipped silently if not enabled)
-
-The old "savings" / lending/union/account endpoint (type="savings") returned 405
-since Binance deprecated it. It is intentionally removed here.
+services/exchanges.py — CCXT exchange balance fetching with caching + retry
 """
 import asyncio
 import logging
 import ccxt.async_support as ccxt
+from services.cache import cache_set, cache_get, cache_get_fallback
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +24,7 @@ SUPPORTED_EXCHANGES: dict[str, str] = {
 EXCHANGES_NEEDING_PASSWORD = {"kucoin", "okx", "bitget"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _strip_ld(asset: str) -> str:
-    """Strip Binance Simple Earn LD prefix: LDUSDT → USDT, LDBTC → BTC."""
     if asset.startswith("LD") and len(asset) > 3:
         underlying = asset[2:]
         if underlying.isupper() and 2 <= len(underlying) <= 10:
@@ -45,11 +33,11 @@ def _strip_ld(asset: str) -> str:
 
 
 def _merge_balances(raw_totals: dict[str, float]) -> dict[str, float]:
-    """Merge LD* earn positions into their underlying: LDUSDT+USDT → USDT."""
     merged: dict[str, float] = {}
     for asset, amount in raw_totals.items():
         if amount and amount > 0:
-            merged[_strip_ld(asset)] = merged.get(_strip_ld(asset), 0) + amount
+            k = _strip_ld(asset)
+            merged[k] = merged.get(k, 0) + amount
     return merged
 
 
@@ -61,22 +49,38 @@ def _build_exchange(exchange_id: str, api_key: str, api_secret: str, password: s
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
+        "options": {
+            "defaultType": "spot",
+            # Prevent CCXT from loading exchangeInfo on every call.
+            # On Render/Railway IPs, Binance blocks the SAPI capital/config
+            # endpoint with 403. Pre-loading markets avoids that entirely.
+            "fetchCurrencies": False,
+        },
     }
     if password:
         cfg["password"] = password
-    return getattr(ccxt, cls_name)(cfg)
+    ex = getattr(ccxt, cls_name)(cfg)
+    return ex
 
-
-# ── Binance ───────────────────────────────────────────────────────────────────
 
 async def _fetch_binance_all(exchange) -> dict[str, float]:
     """
-    Fetch Binance balances from active sub-accounts only.
-    Removed: type="savings" (deprecated, returns 405 on all accounts).
-    spot+earn call already returns LD* prefixed flexible earn balances.
+    Fetch Binance balances without triggering SAPI capital/config endpoints
+    that are IP-restricted (blocked on cloud providers like Render/Railway).
+
+    Strategy:
+    - Load markets once (uses /api/v3/exchangeInfo — always allowed)
+    - Fetch spot+earn balance (uses /api/v3/account — always allowed)
+    - Fetch funding balance (uses /sapi/v1/asset/get-funding-asset — allowed)
+    - Skip cross_margin (uses /sapi/v1/capital/config which is IP-restricted)
     """
     totals: dict[str, float] = {}
+
+    # Pre-load markets to avoid implicit SAPI calls during fetch_balance
+    try:
+        await exchange.load_markets()
+    except Exception as e:
+        log.debug(f"[binance] load_markets: {str(e)[:60]}")
 
     async def _safe(params: dict, label: str):
         try:
@@ -88,28 +92,25 @@ async def _fetch_binance_all(exchange) -> dict[str, float]:
                     count += 1
             log.info(f"[binance] {label}: {count} assets")
         except Exception as e:
-            # Only log as warning for unexpected errors, not deprecation noise
             msg = str(e)
-            if "405" in msg or "deprecated" in msg.lower():
-                log.debug(f"[binance] {label} skipped (deprecated): {msg[:80]}")
+            if any(x in msg for x in ["403", "405", "deprecated", "capital/config"]):
+                log.debug(f"[binance] {label} skipped (restricted/deprecated)")
             else:
                 log.warning(f"[binance] {label} failed: {msg[:120]}")
 
+    # spot+earn: uses /api/v3/account (never IP-restricted)
+    # funding:   uses /sapi/v1/asset/get-funding-asset (generally allowed)
+    # margin:    SKIPPED — requires /sapi/v1/capital/config (IP-restricted)
     await asyncio.gather(
-        _safe({},                       "spot+earn"),   # covers spot + LD* flexible earn
-        _safe({"type": "funding"},      "funding"),     # funding wallet
-        _safe({"type": "cross_margin"}, "margin"),      # margin (skipped if not enabled)
+        _safe({},                  "spot+earn"),
+        _safe({"type": "funding"}, "funding"),
     )
     return totals
 
 
-# ── Generic ───────────────────────────────────────────────────────────────────
-
 async def _fetch_generic(exchange) -> dict[str, float]:
-    """Fetch balances for non-Binance exchanges. Tries funding sub-account too."""
     raw    = await exchange.fetch_balance()
     totals = {a: v for a, v in raw.get("total", {}).items() if v and v > 0}
-
     for account_type in ["funding"]:
         try:
             raw2 = await exchange.fetch_balance(params={"type": account_type})
@@ -121,24 +122,36 @@ async def _fetch_generic(exchange) -> dict[str, float]:
     return totals
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+async def _fetch_with_retry(exchange, exchange_id: str, max_retries: int = 2) -> dict[str, float]:
+    """Fetch with exponential backoff retry on network errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            if exchange_id.lower() == "binance":
+                return await _fetch_binance_all(exchange)
+            else:
+                return await _fetch_generic(exchange)
+        except ccxt.NetworkError as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt   # 1s, 2s
+                log.warning(f"[{exchange_id}] network error, retrying in {wait}s: {e}")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    return {}
+
 
 async def get_exchange_balance(
-    exchange_id: str,
-    api_key: str,
-    api_secret: str,
-    password: str | None = None,
+    exchange_id: str, api_key: str, api_secret: str, password: str | None = None,
 ) -> dict:
+    cache_key = f"{exchange_id}:{api_key[:8]}"
+    cached = cache_get("exchange", cache_key)
+    if cached:
+        return cached
+
     exchange = None
     try:
         exchange = _build_exchange(exchange_id, api_key, api_secret, password)
-
-        raw_totals = (
-            await _fetch_binance_all(exchange)
-            if exchange_id.lower() == "binance"
-            else await _fetch_generic(exchange)
-        )
-
+        raw_totals = await _fetch_with_retry(exchange, exchange_id)
         merged   = _merge_balances(raw_totals)
         balances = [
             {"asset": asset, "free": total, "locked": 0.0, "total": total}
@@ -146,15 +159,25 @@ async def get_exchange_balance(
             if total >= 1e-8
         ]
         balances.sort(key=lambda x: x["total"], reverse=True)
-        return {"exchange": exchange_id, "balances": balances, "error": None}
+        result = {"exchange": exchange_id, "balances": balances, "error": None}
+        cache_set("exchange", cache_key, result)
+        return result
 
     except ccxt.AuthenticationError as e:
         return {"exchange": exchange_id, "balances": [], "error": f"Auth failed — check API keys. ({str(e)[:80]})"}
     except ccxt.NetworkError as e:
+        fallback, age = cache_get_fallback("exchange", cache_key)
+        if fallback:
+            fallback["_stale"] = age
+            return fallback
         return {"exchange": exchange_id, "balances": [], "error": f"Network error: {str(e)[:80]}"}
     except ccxt.ExchangeError as e:
         return {"exchange": exchange_id, "balances": [], "error": f"Exchange error: {str(e)[:80]}"}
     except Exception as e:
+        fallback, age = cache_get_fallback("exchange", cache_key)
+        if fallback:
+            fallback["_stale"] = age
+            return fallback
         return {"exchange": exchange_id, "balances": [], "error": str(e)[:120]}
     finally:
         if exchange:
@@ -166,10 +189,7 @@ async def get_exchange_balance(
 
 async def get_all_exchange_balances(exchanges: list[dict]) -> list[dict]:
     tasks = [
-        get_exchange_balance(
-            ex["exchange_id"], ex["api_key"],
-            ex["api_secret"],  ex.get("api_password"),
-        )
+        get_exchange_balance(ex["exchange_id"], ex["api_key"], ex["api_secret"], ex.get("api_password"))
         for ex in exchanges
     ]
     return list(await asyncio.gather(*tasks))
