@@ -1,27 +1,22 @@
 """
 bot.py — Crypto Portfolio Tracker Bot
-Last confirmed working base + 7 critical fixes:
-  1. Balance result cache (via services/cache.py)
-  2. ERC-20 token balances (via updated services/wallets.py)
-  3. /cancel command — escapes any FSM state
-  4. Rate limiting — max 4 /balances or /portfolio calls per minute
-  5. DB error recovery — graceful startup failure message
-  6. BalanceLog pruning — auto-daily via notifications.py
-  7. /refresh command — clears cache and re-fetches live
+Full feature set: balance cache, ERC-20 tokens, /cancel, rate limiting,
+/refresh, /history, /pnl, /dominance, price alerts, label editing,
+digest settings, admin panel, server IP detection, exchange key updates.
 """
 import asyncio
-import os
 import logging
+import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
@@ -29,17 +24,15 @@ from sqlalchemy import select
 import config
 from db import (
     AsyncSessionLocal, init_db,
-    User, Wallet, Exchange, UserSettings,
+    User, Wallet, Exchange, UserSettings, PriceAlert, BalanceLog,
     get_user_by_telegram_id, create_or_update_user,
     get_wallet_exists, get_or_create_settings, group_wallets_by_address,
 )
 from crypto import encrypt, decrypt
-from services.wallets import (
-    get_all_wallet_balances, CHAIN_CONFIG, CHAIN_SYMBOL, EVM_CHAINS, detect_address_type,
-)
-from services.exchanges import get_all_exchange_balances, SUPPORTED_EXCHANGES
+from services.wallets import get_all_wallet_balances, CHAIN_CONFIG, EVM_CHAINS, detect_address_type
+from services.exchanges import get_all_exchange_balances, SUPPORTED_EXCHANGES, EXCHANGES_NEEDING_PASSWORD
 from services.prices import get_usd_prices
-from services.notifications import poll_and_notify
+from services.notifications import poll_and_notify, send_digest
 from services.cache import is_rate_limited, rate_limit_wait_seconds
 
 logging.basicConfig(level=logging.INFO)
@@ -50,31 +43,112 @@ dp     = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-SUPPORTED_CHAINS = list(CHAIN_CONFIG.keys())
+
+# ── Server IP detection (for exchange API key whitelisting) ──────────────────
+
+_SERVER_PUBLIC_IP: str = ""
+
+
+async def _detect_server_ip() -> str:
+    """Fetch this server's public outbound IP using free services."""
+    services = ["https://api.ipify.org", "https://ipv4.icanhazip.com"]
+    for url in services:
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    ip = (await resp.text()).strip()
+                    if ip and len(ip) < 16:
+                        return ip
+        except Exception:
+            continue
+    return ""
+
+
+def get_server_ip() -> str:
+    """Return auto-detected IP, falling back to SERVER_IP env var."""
+    if _SERVER_PUBLIC_IP:
+        return _SERVER_PUBLIC_IP
+    return config.SERVER_IP
+
+
+# ── Exchange setup guides (with IP whitelist step) ────────────────────────────
 
 EXCHANGE_GUIDES: dict[str, tuple[str, str]] = {
-    "binance":  ("https://www.binance.com/en/my/settings/api-management",
-                 "1. Profile → API Management → Create API\n2. Choose System generated\n3. Enable Read Info ONLY\n4. Complete 2FA → copy Key and Secret"),
-    "coinbase": ("https://www.coinbase.com/settings/api",
-                 "1. Settings → API → New API Key\n2. Permission: view ONLY\n3. Complete 2FA → copy Key and Secret"),
-    "kraken":   ("https://www.kraken.com/u/security/api",
-                 "1. Settings → API → Add key\n2. Permission: Query Funds ONLY\n3. Generate → copy API Key and Private Key"),
-    "kucoin":   ("https://www.kucoin.com/account/api",
-                 "1. Account → API Management → Create API\n2. Set passphrase (save it!)\n3. Permission: General ONLY\n4. Copy Key, Secret AND Passphrase"),
-    "bybit":    ("https://www.bybit.com/app/user/api-management",
-                 "1. Account → API Management → Create New Key\n2. Permissions: Read-Only\n3. Complete 2FA → copy keys"),
-    "okx":      ("https://www.okx.com/account/my-api",
-                 "1. Account → API → Create APIs\n2. Set passphrase (save it!)\n3. Permission: Read ONLY\n4. Copy Key, Secret AND Passphrase"),
-    "bitget":   ("https://www.bitget.com/account/newapi",
-                 "1. Profile → API Management → Create API\n2. Set passphrase\n3. Permission: Read-Only\n4. Copy Key, Secret AND Passphrase"),
-    "gate":     ("https://www.gate.io/myaccount/apiv4keys",
-                 "1. Account → API Management → Create API Key\n2. Permission: Read account info ONLY\n3. Copy Key and Secret"),
-    "mexc":     ("https://www.mexc.com/user/openapi",
-                 "1. Profile → API → Create\n2. Permission: Account Read ONLY\n3. Copy Access Key and Secret Key"),
-    "huobi":    ("https://www.htx.com/en-us/user/api_management",
-                 "1. Account → API Management → Create\n2. Permission: Read Only\n3. Copy Access Key and Secret Key"),
+    "binance": (
+        "https://www.binance.com/en/my/settings/api-management",
+        "1. Profile -> API Management -> Create API\n"
+        "2. Choose System generated\n"
+        "3. Enable Read Info ONLY\n"
+        "4. Under IP access restrictions, select Restrict access and add the server IP shown above\n"
+        "5. Complete 2FA, then copy the API Key and Secret Key"
+    ),
+    "coinbase": (
+        "https://www.coinbase.com/settings/api",
+        "1. Settings -> API -> New API Key\n"
+        "2. Permission: view ONLY\n"
+        "3. Complete 2FA, then copy the Key and Secret"
+    ),
+    "kraken": (
+        "https://www.kraken.com/u/security/api",
+        "1. Settings -> API -> Add key\n"
+        "2. Permission: Query Funds ONLY\n"
+        "3. If available, restrict to the server IP shown above\n"
+        "4. Generate, then copy the API Key and Private Key"
+    ),
+    "kucoin": (
+        "https://www.kucoin.com/account/api",
+        "1. Account -> API Management -> Create API\n"
+        "2. Set a passphrase and save it\n"
+        "3. Permission: General ONLY\n"
+        "4. Under IP whitelist, add the server IP shown above\n"
+        "5. Complete 2FA, then copy the Key, Secret, and Passphrase"
+    ),
+    "bybit": (
+        "https://www.bybit.com/app/user/api-management",
+        "1. Account -> API Management -> Create New Key\n"
+        "2. Permissions: Read-Only\n"
+        "3. IP restriction: add the server IP shown above (required)\n"
+        "4. Complete 2FA, then copy the keys"
+    ),
+    "okx": (
+        "https://www.okx.com/account/my-api",
+        "1. Account -> API -> Create APIs\n"
+        "2. Set a passphrase and save it\n"
+        "3. Permission: Read ONLY\n"
+        "4. IP restriction: add the server IP shown above\n"
+        "5. Complete 2FA, then copy the Key, Secret, and Passphrase"
+    ),
+    "bitget": (
+        "https://www.bitget.com/account/newapi",
+        "1. Profile -> API Management -> Create API\n"
+        "2. Set a label and passphrase\n"
+        "3. Permission: Read-Only\n"
+        "4. IP whitelist: add the server IP shown above\n"
+        "5. Complete 2FA, then copy the Key, Secret, and Passphrase"
+    ),
+    "gate": (
+        "https://www.gate.io/myaccount/apiv4keys",
+        "1. Account -> API Management -> Create API Key\n"
+        "2. Permission: Read account info ONLY\n"
+        "3. IP whitelist: add the server IP shown above\n"
+        "4. Complete 2FA, then copy the Key and Secret"
+    ),
+    "mexc": (
+        "https://www.mexc.com/user/openapi",
+        "1. Profile -> API -> Create\n"
+        "2. Permission: Account Read ONLY\n"
+        "3. IP whitelist (optional): add the server IP shown above\n"
+        "4. Complete 2FA, then copy the Access Key and Secret Key"
+    ),
+    "huobi": (
+        "https://www.htx.com/en-us/user/api_management",
+        "1. Account -> API Management -> Create\n"
+        "2. Permission: Read Only\n"
+        "3. IP whitelist (optional): add the server IP shown above\n"
+        "4. Complete 2FA, then copy the Access Key and Secret Key"
+    ),
 }
-EXCHANGES_NEEDING_PASSWORD = {"kucoin", "okx", "bitget"}
 
 
 # ── MarkdownV2 helpers ────────────────────────────────────────────────────────
@@ -82,19 +156,23 @@ EXCHANGES_NEEDING_PASSWORD = {"kucoin", "okx", "bitget"}
 def md(text) -> str:
     text = str(text)
     for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
+        text = text.replace(ch, "\\" + ch)
     return text
 
-def bold(text) -> str:   return f"*{md(text)}*"
-def code(text) -> str:   return f"`{md(text)}`"
+
+def bold(text) -> str:
+    return "*" + md(text) + "*"
+
 
 def fmt_usd(amount: float) -> str:
     if amount < 0.01:
         return "\\<\\$0\\.01"
     return md(f"${amount:,.2f}")
 
+
 def fmt_num(amount: float, decimals: int = 6) -> str:
     return md(f"{amount:.{decimals}f}")
+
 
 def check_allowed(user_id: int) -> bool:
     if not config.ALLOWED_USER_IDS:
@@ -102,27 +180,39 @@ def check_allowed(user_id: int) -> bool:
     return user_id in config.ALLOWED_USER_IDS
 
 
+def is_admin(user_id: int) -> bool:
+    if config.ADMIN_USER_IDS:
+        return user_id in config.ADMIN_USER_IDS
+    if config.ALLOWED_USER_IDS:
+        return user_id in config.ALLOWED_USER_IDS
+    return True
+
+
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Balances"),      KeyboardButton(text="📊 Portfolio")],
-        [KeyboardButton(text="➕ Add Wallet"),    KeyboardButton(text="➕ Add Exchange")],
-        [KeyboardButton(text="📋 My Wallets"),    KeyboardButton(text="📋 My Exchanges")],
-        [KeyboardButton(text="🗑 Remove Wallet"),  KeyboardButton(text="🗑 Remove Exchange")],
-        [KeyboardButton(text="⚙️ Settings"),      KeyboardButton(text="❓ Help")],
+        [KeyboardButton(text="💰 Balances"), KeyboardButton(text="📊 Portfolio")],
+        [KeyboardButton(text="📈 History"), KeyboardButton(text="💹 P&L")],
+        [KeyboardButton(text="➕ Add Wallet"), KeyboardButton(text="➕ Add Exchange")],
+        [KeyboardButton(text="📋 My Wallets"), KeyboardButton(text="📋 My Exchanges")],
+        [KeyboardButton(text="🗑 Remove Wallet"), KeyboardButton(text="🗑 Remove Exchange")],
+        [KeyboardButton(text="🔄 Update Exchange"), KeyboardButton(text="🌐 Server IP")],
+        [KeyboardButton(text="⚙️ Settings"), KeyboardButton(text="❓ Help")],
     ],
     resize_keyboard=True,
 )
 
 SETTINGS_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💵 Min Balance Filter"),  KeyboardButton(text="🔔 Alert Threshold")],
-        [KeyboardButton(text="💸 Min Alert Amount"),    KeyboardButton(text="🔕 Toggle Notifications")],
-        [KeyboardButton(text="📊 View My Settings"),    KeyboardButton(text="🔙 Back to Menu")],
+        [KeyboardButton(text="💵 Min Balance Filter"), KeyboardButton(text="🔔 Alert Threshold")],
+        [KeyboardButton(text="💸 Min Alert Amount"), KeyboardButton(text="🔕 Toggle Notifications")],
+        [KeyboardButton(text="📅 Digest Settings"), KeyboardButton(text="🎯 Price Alerts")],
+        [KeyboardButton(text="📊 View My Settings"), KeyboardButton(text="🔙 Back to Menu")],
     ],
     resize_keyboard=True,
 )
+
 
 def cancel_kb(back_to_settings: bool = False) -> ReplyKeyboardMarkup:
     btn = "🔙 Back to Settings" if back_to_settings else "❌ Cancel"
@@ -136,9 +226,16 @@ class AddWallet(StatesGroup):
     choosing_chains  = State()
     entering_label   = State()
 
+
 class AddChainToWallet(StatesGroup):
-    choosing_wallet  = State()
-    choosing_chains  = State()
+    choosing_wallet = State()
+    choosing_chains = State()
+
+
+class EditWalletLabel(StatesGroup):
+    choosing_wallet = State()
+    entering_label  = State()
+
 
 class AddExchange(StatesGroup):
     choosing_exchange = State()
@@ -147,17 +244,40 @@ class AddExchange(StatesGroup):
     entering_password = State()
     entering_label    = State()
 
+
+class EditExchangeLabel(StatesGroup):
+    choosing_exchange = State()
+    entering_label    = State()
+
+
+class UpdatingExchange(StatesGroup):
+    choosing_exchange = State()
+    choosing_action   = State()
+    entering_key      = State()
+    entering_secret   = State()
+    entering_password = State()
+
+
 class RemovingWallet(StatesGroup):
-    choosing_wallet  = State()
-    choosing_action  = State()
+    choosing_wallet = State()
+    choosing_action = State()
+
 
 class RemovingExchange(StatesGroup):
     waiting_for_choice = State()
+
 
 class Settings(StatesGroup):
     min_balance     = State()
     alert_threshold = State()
     min_alert_usd   = State()
+
+
+class AddPriceAlert(StatesGroup):
+    entering_asset     = State()
+    entering_direction = State()
+    entering_price     = State()
+
 
 _EVM_LABEL_TO_CHAIN = {
     f"{CHAIN_CONFIG[c]['emoji']} {CHAIN_CONFIG[c]['label']}": c
@@ -165,7 +285,7 @@ _EVM_LABEL_TO_CHAIN = {
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Settings helpers ──────────────────────────────────────────────────────────
 
 async def _load_settings(telegram_id: int) -> UserSettings | None:
     async with AsyncSessionLocal() as db:
@@ -173,6 +293,7 @@ async def _load_settings(telegram_id: int) -> UserSettings | None:
         if not user:
             return None
         return await get_or_create_settings(db, user)
+
 
 async def _save_setting(telegram_id: int, **kwargs) -> UserSettings | None:
     async with AsyncSessionLocal() as db:
@@ -186,31 +307,38 @@ async def _save_setting(telegram_id: int, **kwargs) -> UserSettings | None:
         await db.refresh(s)
         return s
 
+
 def _settings_summary(s: UserSettings) -> str:
-    notif = "ON 🔔" if s.notifications_enabled else "OFF 🔕"
+    notif  = "ON" if s.notifications_enabled else "OFF"
+    digest = f"{s.digest_frequency.capitalize()} digest" if s.digest_enabled else "Off"
     return (
         f"⚙️ *Your Settings*\n\n"
         f"💵 *Min balance:* {fmt_usd(s.min_balance_usd)}\n"
-        f"    _Hides assets below this in /balances \\& /portfolio_\n\n"
         f"🔔 *Alert threshold:* {md(f'{s.notify_threshold_pct:.1f}')}%\n"
-        f"    _Notifies when balance changes by this %_\n\n"
         f"💸 *Min alert amount:* {fmt_usd(s.notify_min_usd)}\n"
-        f"    _Alerts only if move is worth at least this_\n\n"
         f"📳 *Notifications:* {md(notif)}\n"
+        f"📅 *Digest:* {md(digest)}\n"
     )
+
+
+# ── Wallet grouping helpers ────────────────────────────────────────────────────
 
 def _chain_tags(chains: list[str]) -> str:
     return "".join(CHAIN_CONFIG.get(c, {}).get("emoji", "") for c in sorted(chains))
 
+
 def _chain_names(chains: list[str]) -> str:
     return ", ".join(CHAIN_CONFIG.get(c, {}).get("label", c) for c in sorted(chains))
+
 
 def _build_wallet_groups(wallets: list) -> list[dict]:
     raw = group_wallets_by_address(wallets)
     return [{"address": addr, **info} for addr, info in raw.items()]
 
+
 def _evm_chains_not_tracked(tracked_chains: list[str]) -> list[str]:
     return [c for c in EVM_CHAINS if c not in tracked_chains]
+
 
 async def _get_user_portfolio(telegram_id: int) -> tuple[list, list, float]:
     async with AsyncSessionLocal() as db:
@@ -234,17 +362,13 @@ async def _get_user_portfolio(telegram_id: int) -> tuple[list, list, float]:
         return wallets, exchanges, s.min_balance_usd
 
 
-# ── FIX 4: Rate limit guard ───────────────────────────────────────────────────
+# ── Rate limit guard decorator ────────────────────────────────────────────────
 
 def rate_limited(func):
-    """Reject if user exceeds RATE_LIMIT_PER_MINUTE calls to expensive commands."""
     async def wrapper(message: Message, state: FSMContext):
         if is_rate_limited(message.from_user.id, config.RATE_LIMIT_PER_MINUTE):
             wait = rate_limit_wait_seconds(message.from_user.id)
-            await message.answer(
-                f"⏳ Too many requests\\. Try again in *{wait}s*\\.",
-                parse_mode="MarkdownV2",
-            )
+            await message.answer(f"⏳ Slow down\\! Try again in {wait}s\\.", parse_mode="MarkdownV2")
             return
         return await func(message, state)
     wrapper.__name__ = func.__name__
@@ -265,34 +389,34 @@ async def cmd_start(message: Message, state: FSMContext):
             first_name=message.from_user.first_name,
         )
         await get_or_create_settings(db, user)
+
     name = md(message.from_user.first_name or "there")
     await message.answer(
         f"👋 Welcome, *{name}*\\!\n\n"
-        "I track your crypto balances across wallets and exchanges\\.\n\n"
-        "  • *➕ Add Wallet* — paste any wallet address\n"
-        "  • *➕ Add Exchange* — connect Binance, Bybit, OKX, etc\\.\n"
+        "I track your crypto portfolio across wallets and exchanges\\.\n\n"
+        "  • *➕ Add Wallet* — any address \\(ETH, SOL, BTC \\+ more\\)\n"
+        "  • *➕ Add Exchange* — Binance, Bybit, OKX and more\n"
         "  • *💰 Balances* — live balances with USD values\n"
-        "  • *⚙️ Settings* — filter dust, set alert thresholds\n\n"
-        "_API keys are encrypted at rest\\. Use /cancel anytime to go back\\._",
+        "  • *📈 History* — 7\\-day balance chart\n"
+        "  • *🎯 Price Alerts* — get notified at your target price\n"
+        "  • *⚙️ Settings* — filters, thresholds, digest\n\n"
+        "_API keys are encrypted at rest\\._",
         parse_mode="MarkdownV2",
         reply_markup=MAIN_MENU,
     )
 
 
-# ── FIX 3: /cancel — universal FSM escape ────────────────────────────────────
+# ── /cancel — universal FSM escape ────────────────────────────────────────────
 
 @router.message(Command("cancel"))
+@router.message(F.text == "❌ Cancel")
 async def cmd_cancel(message: Message, state: FSMContext):
     current = await state.get_state()
     await state.clear()
     if current:
-        await message.answer(
-            "❌ Cancelled\\. Back to main menu\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=MAIN_MENU,
-        )
+        await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     else:
-        await message.answer("Nothing to cancel\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        await message.answer("Nothing to cancel.", reply_markup=MAIN_MENU)
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
@@ -301,48 +425,74 @@ async def cmd_cancel(message: Message, state: FSMContext):
 @router.message(F.text == "❓ Help")
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "*Commands*\n\n"
-        "💰 /balances — Live wallet \\& exchange balances\n"
-        "📊 /portfolio — Total USD value by asset\n"
-        "🔄 /refresh — Force fresh data \\(bypasses cache\\)\n"
-        "📋 /mywallets — View wallets grouped by address\n"
-        "📋 /myexchanges — List connected exchanges\n"
-        "➕ /addwallet — Track a blockchain wallet\n"
-        "➕ /addchain — Add chains to existing wallet\n"
-        "🗑 /removewallet — Remove a wallet or chain\n"
-        "➕ /addexchange — Connect an exchange\n"
-        "🗑 /removeexchange — Disconnect an exchange\n"
-        "⚙️ /settings — Filters, alert thresholds\n"
-        "❌ /cancel — Cancel any ongoing action\n\n"
-        "*Chains:* ETH, BNB, Polygon, Arbitrum, Optimism, Base, Avalanche, Solana, Bitcoin\n"
-        "*Exchanges:* Binance, Coinbase, Kraken, KuCoin, Bybit, OKX, Bitget, Gate, MEXC, HTX",
-        parse_mode="MarkdownV2",
-        reply_markup=MAIN_MENU,
-    )
+    lines = [
+        "*Commands*",
+        "",
+        "💰 /balances — Live wallet \\& exchange balances",
+        "📊 /portfolio — Total USD by asset",
+        "🔄 /refresh — Force\\-refresh all balances now",
+        "📈 /history — 7\\-day balance history",
+        "💹 /pnl — Profit \\& loss vs first snapshot",
+        "🌐 /dominance — BTC\\/ETH share of portfolio",
+        "🎯 /pricealert — Set a price alert",
+        "📋 /mywallets — Grouped wallet list",
+        "📋 /myexchanges — Connected exchanges",
+        "➕ /addwallet — Track a wallet",
+        "➕ /addchain — Add chains to existing wallet",
+        "✏️ /editwallet — Rename a wallet",
+        "✏️ /editexchange — Rename an exchange",
+        "🗑 /removewallet — Remove wallet\\/chain",
+        "🗑 /removeexchange — Disconnect exchange",
+        "🔄 /updateexchange — Update API keys for an exchange",
+        "🌐 /serverip — Show this server's public IP",
+        "⚙️ /settings — Filters, alerts, digest",
+        "❌ /cancel — Cancel any ongoing action",
+        "",
+        "_EVM chains: ETH, BNB, Polygon, Arbitrum, Optimism, Base, Avalanche_",
+        "_Other: Solana, Bitcoin_",
+    ]
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── FIX 7: /refresh ──────────────────────────────────────────────────────────
+# ── /serverip — show server's public IP for whitelisting ─────────────────────
 
-@router.message(Command("refresh"))
-async def cmd_refresh(message: Message, state: FSMContext):
+@router.message(Command("serverip"))
+@router.message(F.text == "🌐 Server IP")
+async def cmd_server_ip(message: Message, state: FSMContext):
     await state.clear()
-    # Clear ALL cached balance entries so next fetch is live
-    from services.cache import _CACHE
-    keys_to_remove = [k for k in list(_CACHE.keys())
-                      if k.startswith("wallet:") or k.startswith("exchange:")]
-    for k in keys_to_remove:
-        _CACHE.pop(k, None)
-    count = len(keys_to_remove)
-    await message.answer(
-        f"🔄 Cleared {count} cached entr{'y' if count==1 else 'ies'}\\. "
-        f"Use *💰 Balances* to fetch fresh data\\.",
-        parse_mode="MarkdownV2",
-        reply_markup=MAIN_MENU,
-    )
+    server_ip = get_server_ip()
+
+    if server_ip:
+        ip_list = [ip.strip() for ip in server_ip.split(",") if ip.strip()]
+        lines = ["🌐 *This bot's server IP*", ""]
+        for ip in ip_list:
+            lines.append(f"`{md(ip)}`")
+        lines += [
+            "",
+            "*Add this IP to your exchange API key whitelist* to fix 403 errors\\.",
+            "",
+            "After whitelisting, use *🔄 Update Exchange* to re\\-enter your keys\\.",
+            "",
+            "_Go to your exchange API settings, find IP restriction, and add this IP\\._",
+        ]
+        await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+    else:
+        lines = [
+            "🌐 *Server IP*",
+            "",
+            "Could not detect server IP automatically\\.",
+            "",
+            "To find it:",
+            "  • *Render:* Dashboard \\-\\> your service \\-\\> Outbound IPs",
+            "  • *Railway:* Static IP requires a paid plan",
+            "  • *VPS:* run `curl ipify\\.org` in your server terminal",
+            "",
+            "Then set `SERVER\\_IP\\=your\\.ip\\.here` in environment variables\\.",
+        ]
+        await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /balances — FIX 1 (cache), FIX 2 (ERC-20), FIX 4 (rate limit) ───────────
+# ── /balances ─────────────────────────────────────────────────────────────────
 
 @router.message(Command("balances"))
 @router.message(F.text == "💰 Balances")
@@ -353,41 +503,32 @@ async def cmd_balances(message: Message, state: FSMContext):
 
     if not wallets and not exchanges:
         return await message.answer(
-            "No wallets or exchanges added yet\\.\n"
-            "Use *➕ Add Wallet* or *➕ Add Exchange* to get started\\.",
+            "No wallets or exchanges added yet\\.\nUse *➕ Add Wallet* or *➕ Add Exchange*\\.",
             parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
         )
 
     filter_note = f" _\\(hiding below {fmt_usd(min_usd)}\\)_" if min_usd > 0 else ""
-    status_msg  = await message.answer(
-        f"⏳ Fetching balances{filter_note}\\.\\.\\.", parse_mode="MarkdownV2"
-    )
+    status_msg = await message.answer(f"⏳ Fetching balances{filter_note}\\.\\.\\.", parse_mode="MarkdownV2")
 
     try:
         lines, hidden_count = [], 0
-        has_stale = False
 
-        # ── Wallets ──────────────────────────────────────────────────────
         if wallets:
             try:
-                wallet_results = await asyncio.wait_for(
-                    get_all_wallet_balances(wallets), timeout=25.0
-                )
+                wallet_results = await asyncio.wait_for(get_all_wallet_balances(wallets), timeout=25.0)
             except asyncio.TimeoutError:
                 wallet_results = [
-                    {**w, "balance": 0.0,
-                     "symbol": CHAIN_CONFIG.get(w["chain"], {}).get("symbol", "?"),
-                     "error": "Timed out — try /refresh", "tokens": []}
+                    {**w, "balance": 0.0, "symbol": CHAIN_CONFIG.get(w["chain"], {}).get("symbol", "?"),
+                     "error": "Timed out — try again", "tokens": []}
                     for w in wallets
                 ]
 
-            # Collect all symbols including ERC-20 tokens
-            all_syms = list({r["symbol"] for r in wallet_results if not r.get("error")})
+            all_symbols = list({r["symbol"] for r in wallet_results if not r.get("error")})
             for r in wallet_results:
                 for t in r.get("tokens", []):
-                    if t["symbol"] not in all_syms:
-                        all_syms.append(t["symbol"])
-            prices = await get_usd_prices(all_syms) if all_syms else {}
+                    if t["symbol"] not in all_symbols:
+                        all_symbols.append(t["symbol"])
+            prices = await get_usd_prices(all_symbols) if all_symbols else {}
 
             addr_groups: dict[str, list] = defaultdict(list)
             for r in wallet_results:
@@ -396,36 +537,31 @@ async def cmd_balances(message: Message, state: FSMContext):
             lines.append("🏦 *Wallets*")
             for addr, results in addr_groups.items():
                 sample_label = next((r["label"] for r in results if r.get("label")), None)
-                all_chains   = [r["chain"] for r in results]
+                all_chains = [r["chain"] for r in results]
                 tags = _chain_tags(all_chains)
-                lbl  = md(sample_label) if sample_label else md(addr[:6] + "…" + addr[-4:])
-                lines.append(f"\n  {tags} {bold(lbl)}")
+                lbl = md(sample_label) if sample_label else md(addr[:6] + "…" + addr[-4:])
+                lines.append("")
+                lines.append(f"  {tags} {bold(lbl)}")
 
                 for r in results:
-                    cfg   = CHAIN_CONFIG.get(r["chain"], {})
+                    cfg = CHAIN_CONFIG.get(r["chain"], {})
                     emoji = cfg.get("emoji", "")
                     cname = md(cfg.get("label", r["chain"]))
-
                     if r.get("error"):
-                        stale = f" _{md('(cached ' + str(r['_stale']) + 's ago)')}_" if r.get("_stale") else ""
-                        lines.append(f"    {emoji} {cname}: ❌ {md(r['error'][:60])}{stale}")
+                        lines.append(f"    {emoji} {cname}: ❌ {md(r['error'][:60])}")
                     else:
-                        if r.get("_stale"):
-                            has_stale = True
                         bal = r["balance"]
                         sym = r["symbol"]
                         usd = bal * prices.get(sym, 0)
-                        stale = f" _\\(cached\\)_" if r.get("_stale") else ""
                         if usd < min_usd and bal > 0 and min_usd > 0:
                             hidden_count += 1
                         else:
+                            stale = " _\\(cached\\)_" if r.get("_stale") else ""
                             usd_str = f" \\({fmt_usd(usd)}\\)" if usd >= 0.01 else ""
                             lines.append(f"    {emoji} {cname}: `{fmt_num(bal)} {md(sym)}`{usd_str}{stale}")
 
-                        # FIX 2: ERC-20 tokens
                         for tok in r.get("tokens", []):
-                            t_sym = tok["symbol"]
-                            t_bal = tok["balance"]
+                            t_sym, t_bal = tok["symbol"], tok["balance"]
                             t_usd = t_bal * prices.get(t_sym, 0)
                             if t_usd < min_usd and min_usd > 0:
                                 hidden_count += 1
@@ -433,56 +569,50 @@ async def cmd_balances(message: Message, state: FSMContext):
                             t_usd_str = f" \\({fmt_usd(t_usd)}\\)" if t_usd >= 0.01 else ""
                             lines.append(f"       `{md(t_sym)}` {fmt_num(t_bal)}{t_usd_str}")
 
-        # ── Exchanges ─────────────────────────────────────────────────────
         if exchanges:
-            if lines:
-                lines.append("")
+            lines.append("")
             lines.append("💱 *Exchanges*")
             try:
-                exchange_results = await asyncio.wait_for(
-                    get_all_exchange_balances(exchanges), timeout=25.0
-                )
+                exchange_results = await asyncio.wait_for(get_all_exchange_balances(exchanges), timeout=25.0)
             except asyncio.TimeoutError:
                 exchange_results = [
-                    {"exchange": e["exchange_id"], "balances": [],
-                     "error": "Timed out — try /refresh"}
+                    {"exchange": e["exchange_id"], "balances": [], "error": "Timed out — try again"}
                     for e in exchanges
                 ]
 
             for i, r in enumerate(exchange_results):
                 lbl = md(exchanges[i].get("label") or r["exchange"].upper())
-                stale = f" _\\(cached {r['_stale']}s ago\\)_" if r.get("_stale") else ""
-                if r.get("_stale"):
-                    has_stale = True
+                stale = " _\\(cached\\)_" if r.get("_stale") else ""
                 if r.get("error"):
-                    lines.append(f"  {bold(lbl)}\n    ❌ {md(r['error'][:80])}")
+                    lines.append("")
+                    lines.append(f"  {bold(lbl)}")
+                    lines.append(f"    ❌ {md(r['error'][:80])}")
                     continue
                 if not r["balances"]:
-                    lines.append(f"  {bold(lbl)}\n    _No balances found_")
+                    lines.append("")
+                    lines.append(f"  {bold(lbl)}")
+                    lines.append("    _No balances found_")
                     continue
-                lines.append(f"\n  {bold(lbl)}{stale}")
-                syms   = [b["asset"] for b in r["balances"]]
+                lines.append("")
+                lines.append(f"  {bold(lbl)}{stale}")
+                syms = [b["asset"] for b in r["balances"]]
                 prices = await get_usd_prices(syms) if syms else {}
                 ex_hidden = 0
                 for b in r["balances"]:
                     sym, tot = b["asset"], b["total"]
                     usd = tot * prices.get(sym, 0)
                     if usd < min_usd and tot > 0 and min_usd > 0:
-                        ex_hidden += 1; hidden_count += 1; continue
-                    usd_str    = f" \\({fmt_usd(usd)}\\)" if usd >= 0.01 else ""
-                    locked_str = f" \\[locked: {fmt_num(b.get('locked',0),4)}\\]" if b.get("locked",0) > 0 else ""
-                    lines.append(f"    • `{md(sym)}` {fmt_num(tot)}{locked_str}{usd_str}")
+                        ex_hidden += 1
+                        hidden_count += 1
+                        continue
+                    usd_str = f" \\({fmt_usd(usd)}\\)" if usd >= 0.01 else ""
+                    lines.append(f"    • `{md(sym)}` {fmt_num(tot)}{usd_str}")
                 if ex_hidden:
-                    lines.append(f"    _\\+ {ex_hidden} asset\\(s\\) below {fmt_usd(min_usd)} hidden_")
+                    lines.append(f"    _\\+ {ex_hidden} small asset\\(s\\) hidden_")
 
-        # Footer
-        footer = []
         if hidden_count > 0:
-            footer.append(f"_⚙️ {hidden_count} asset\\(s\\) below {fmt_usd(min_usd)} hidden — /settings_")
-        if has_stale:
-            footer.append("_Some data served from cache — use /refresh for live data_")
-        if footer:
-            lines.append("\n" + "\n".join(footer))
+            lines.append("")
+            lines.append(f"_⚙️ {hidden_count} asset\\(s\\) below {fmt_usd(min_usd)} hidden — /settings_")
 
         text = "\n".join(lines) if lines else "No balances to show\\."
         if len(text) > 4000:
@@ -494,13 +624,24 @@ async def cmd_balances(message: Message, state: FSMContext):
     except Exception as e:
         log.exception("Balances error")
         await status_msg.delete()
-        await message.answer(
-            f"❌ Error fetching balances: {md(str(e)[:120])}",
-            parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
-        )
+        await message.answer(f"❌ Error: {md(str(e)[:120])}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /portfolio ─────────────────────────────────────────────────────────────
+# ── /refresh ──────────────────────────────────────────────────────────────────
+
+@router.message(Command("refresh"))
+@router.message(F.text == "🔄 Refresh")
+async def cmd_refresh(message: Message, state: FSMContext):
+    await state.clear()
+    from services.cache import _CACHE
+    keys_to_remove = [k for k in _CACHE if k.startswith("wallet:") or k.startswith("exchange:")]
+    for k in keys_to_remove:
+        del _CACHE[k]
+    await message.answer("🔄 Cache cleared\\. Fetching fresh data\\.\\.\\.", parse_mode="MarkdownV2")
+    await cmd_balances(message, state)
+
+
+# ── /portfolio ────────────────────────────────────────────────────────────────
 
 @router.message(Command("portfolio"))
 @router.message(F.text == "📊 Portfolio")
@@ -510,14 +651,10 @@ async def cmd_portfolio(message: Message, state: FSMContext):
     wallets, exchanges, min_usd = await _get_user_portfolio(message.from_user.id)
 
     if not wallets and not exchanges:
-        return await message.answer(
-            "No wallets or exchanges added yet\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU
-        )
+        return await message.answer("No wallets or exchanges added yet\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
     filter_note = f" _\\(hiding below {fmt_usd(min_usd)}\\)_" if min_usd > 0 else ""
-    status_msg  = await message.answer(
-        f"⏳ Calculating portfolio{filter_note}\\.\\.\\.", parse_mode="MarkdownV2"
-    )
+    status_msg = await message.answer(f"⏳ Calculating portfolio{filter_note}\\.\\.\\.", parse_mode="MarkdownV2")
 
     try:
         totals: dict[str, float] = {}
@@ -551,40 +688,38 @@ async def cmd_portfolio(message: Message, state: FSMContext):
         if not totals:
             await status_msg.delete()
             return await message.answer(
-                "No balances found\\. Try /refresh if this seems wrong\\.",
+                "No balances found\\. Try /refresh if balances seem missing\\.",
                 parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
             )
 
-        prices      = await get_usd_prices(list(totals.keys()))
-        rows        = [(sym, amt, amt * prices.get(sym, 0)) for sym, amt in totals.items()]
+        prices = await get_usd_prices(list(totals.keys()))
+        rows = [(sym, amt, amt * prices.get(sym, 0)) for sym, amt in totals.items()]
         grand_total = sum(r[2] for r in rows)
         rows.sort(key=lambda x: x[2], reverse=True)
 
         visible, hidden_count, hidden_usd = [], 0, 0.0
         for sym, amt, usd in rows:
             if usd < min_usd and min_usd > 0:
-                hidden_count += 1; hidden_usd += usd
+                hidden_count += 1
+                hidden_usd += usd
             else:
                 visible.append((sym, amt, usd))
 
-        lines = ["📊 *Portfolio summary*\n"]
+        lines = ["📊 *Portfolio summary*", ""]
         for sym, amt, usd in visible:
-            pct    = (usd / grand_total * 100) if grand_total else 0
+            pct = (usd / grand_total * 100) if grand_total else 0
             filled = int(pct / 5)
-            bar    = "▓" * filled + "░" * (20 - filled)
-            lines.append(
-                f"`{md(sym):<6}` {fmt_num(amt, 4)}\n"
-                f"  {fmt_usd(usd)} \\({md(f'{pct:.1f}')}%\\)\n"
-                f"  `{bar}`\n"
-            )
+            bar = "▓" * filled + "░" * (20 - filled)
+            lines.append(f"`{md(sym):<6}` {fmt_num(amt, 4)}")
+            lines.append(f"  {fmt_usd(usd)} \\({md(f'{pct:.1f}')}%\\)")
+            lines.append(f"  `{bar}`")
+            lines.append("")
 
         if hidden_count:
-            lines.append(
-                f"_\\+ {hidden_count} asset\\(s\\) worth {fmt_usd(hidden_usd)} hidden "
-                f"\\(below {fmt_usd(min_usd)} filter\\)_\n"
-            )
+            lines.append(f"_\\+ {hidden_count} asset\\(s\\) worth {fmt_usd(hidden_usd)} hidden \\(below {fmt_usd(min_usd)} filter\\)_")
+            lines.append("")
 
-        lines.append(f"\n💵 *Total: {fmt_usd(grand_total)} USD*")
+        lines.append(f"💵 *Total: {fmt_usd(grand_total)} USD*")
         if has_stale:
             lines.append("_Some data from cache — use /refresh for live data_")
         if min_usd > 0:
@@ -596,9 +731,293 @@ async def cmd_portfolio(message: Message, state: FSMContext):
     except Exception as e:
         log.exception("Portfolio error")
         await status_msg.delete()
-        await message.answer(
-            f"❌ Error: {md(str(e)[:120])}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU
+        await message.answer(f"❌ Error: {md(str(e)[:120])}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── /history ──────────────────────────────────────────────────────────────────
+
+@router.message(Command("history"))
+@router.message(F.text == "📈 History")
+async def cmd_history(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            return await message.answer("Please /start first.")
+
+        since = datetime.utcnow() - timedelta(days=7)
+        result = await db.execute(
+            select(BalanceLog)
+            .where(BalanceLog.user_id == user.id, BalanceLog.recorded_at >= since)
+            .order_by(BalanceLog.recorded_at.asc())
         )
+        logs = result.scalars().all()
+
+    if not logs:
+        return await message.answer(
+            "No history yet\\. The bot needs to run for at least one polling cycle to record data\\.",
+            parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
+        )
+
+    daily: dict[str, float] = {}
+    for entry in logs:
+        day = entry.recorded_at.strftime("%Y-%m-%d")
+        daily[day] = max(daily.get(day, 0), entry.usd_value or 0)
+
+    days = sorted(daily.keys())[-7:]
+    values = [daily.get(d, 0) for d in days]
+    max_v = max(values) if values else 1
+    min_v = min(values) if values else 0
+    rng = max_v - min_v or 1
+
+    bars = "▁▂▃▄▅▆▇█"
+    spark = "".join(bars[min(7, int((v - min_v) / rng * 7))] for v in values)
+
+    lines = ["📈 *7\\-Day Portfolio History*", "", f"`{md(spark)}`", ""]
+    for day, val in zip(days, values):
+        lines.append(f"  `{md(day)}` {fmt_usd(val)}")
+
+    lines.append("")
+    lines.append(f"📊 *Peak:* {fmt_usd(max_v)}")
+    lines.append(f"📉 *Low:*  {fmt_usd(min_v)}")
+
+    if len(values) >= 2 and values[0]:
+        change = values[-1] - values[0]
+        arrow = "📈" if change >= 0 else "📉"
+        sign = "\\+" if change >= 0 else "\\-"
+        pct_change = abs(change / values[0] * 100)
+        lines.append(f"{arrow} *7d change:* {fmt_usd(abs(change))} \\({sign}{md(f'{pct_change:.1f}')}%\\)")
+
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── /pnl ──────────────────────────────────────────────────────────────────────
+
+@router.message(Command("pnl"))
+@router.message(F.text == "💹 P&L")
+async def cmd_pnl(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            return await message.answer("Please /start first.")
+
+        result = await db.execute(
+            select(BalanceLog).where(BalanceLog.user_id == user.id).order_by(BalanceLog.recorded_at.asc())
+        )
+        all_logs = result.scalars().all()
+
+    if not all_logs:
+        return await message.answer("No history yet\\. Run the bot for a while first\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+    first: dict[str, float] = {}
+    latest: dict[str, float] = {}
+    for entry in all_logs:
+        if entry.usd_value is None:
+            continue
+        if entry.asset not in first:
+            first[entry.asset] = entry.usd_value
+        latest[entry.asset] = entry.usd_value
+
+    lines = ["💹 *Profit \\& Loss vs first snapshot*", ""]
+    total_first, total_latest = 0.0, 0.0
+    rows = []
+    for asset, first_val in first.items():
+        last_val = latest.get(asset, first_val)
+        diff = last_val - first_val
+        pct = (diff / first_val * 100) if first_val else 0
+        total_first += first_val
+        total_latest += last_val
+        rows.append((asset, first_val, last_val, diff, pct))
+
+    rows.sort(key=lambda x: abs(x[3]), reverse=True)
+    for asset, first_val, last_val, diff, pct in rows[:15]:
+        arrow = "📈" if diff >= 0 else "📉"
+        sign = "\\+" if diff >= 0 else "\\-"
+        lines.append(f"{arrow} `{md(asset):<6}` {fmt_usd(first_val)} → {fmt_usd(last_val)}")
+        lines.append(f"   {sign}{fmt_usd(abs(diff))} \\({sign}{md(f'{abs(pct):.1f}')}%\\)")
+
+    total_diff = total_latest - total_first
+    total_pct = (total_diff / total_first * 100) if total_first else 0
+    total_sign = "\\+" if total_diff >= 0 else "\\-"
+    total_arrow = "📈" if total_diff >= 0 else "📉"
+    lines.append("")
+    lines.append(f"{total_arrow} *Total: {total_sign}{fmt_usd(abs(total_diff))} \\({total_sign}{md(f'{abs(total_pct):.1f}')}%\\)*")
+
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── /dominance ────────────────────────────────────────────────────────────────
+
+@router.message(Command("dominance"))
+async def cmd_dominance(message: Message, state: FSMContext):
+    await state.clear()
+    wallets, exchanges, min_usd = await _get_user_portfolio(message.from_user.id)
+    if not wallets and not exchanges:
+        return await message.answer("No wallets or exchanges added yet\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+    status_msg = await message.answer("⏳ Calculating dominance\\.\\.\\.", parse_mode="MarkdownV2")
+    try:
+        totals: dict[str, float] = {}
+        if wallets:
+            results = await asyncio.wait_for(get_all_wallet_balances(wallets), timeout=20.0)
+            for r in results:
+                if not r.get("error") and r["balance"] > 0:
+                    totals[r["symbol"]] = totals.get(r["symbol"], 0) + r["balance"]
+        if exchanges:
+            results = await asyncio.wait_for(get_all_exchange_balances(exchanges), timeout=20.0)
+            for r in results:
+                for b in r.get("balances", []):
+                    totals[b["asset"]] = totals.get(b["asset"], 0) + b["total"]
+
+        prices = await get_usd_prices(list(totals.keys()))
+        rows = [(s, a, a * prices.get(s, 0)) for s, a in totals.items()]
+        grand_total = sum(r[2] for r in rows)
+        rows.sort(key=lambda x: x[2], reverse=True)
+
+        lines = ["🌐 *Portfolio Dominance*", ""]
+        for sym, amt, usd in rows[:10]:
+            pct = (usd / grand_total * 100) if grand_total else 0
+            filled = int(pct / 5)
+            bar = "█" * filled + "░" * (20 - filled)
+            lines.append(f"`{md(sym):<6}` {md(f'{pct:.1f}')}%")
+            lines.append(f"  `{bar}`")
+
+        lines.append("")
+        lines.append(f"💵 *Total: {fmt_usd(grand_total)}*")
+        await status_msg.delete()
+        await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await status_msg.delete()
+        await message.answer(f"❌ Error: {md(str(e)[:80])}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── Price Alerts ──────────────────────────────────────────────────────────────
+
+@router.message(Command("pricealert"))
+@router.message(F.text == "🎯 Price Alerts")
+async def cmd_price_alert_menu(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            return await message.answer("Please /start first.")
+        result = await db.execute(
+            select(PriceAlert).where(PriceAlert.user_id == user.id, PriceAlert.triggered == False)
+        )
+        alerts = result.scalars().all()
+
+    lines = ["🎯 *Price Alerts*", ""]
+    if alerts:
+        for i, a in enumerate(alerts, 1):
+            lines.append(f"{i}\\. `{md(a.asset)}` {md(a.direction)} {fmt_usd(a.target_usd)}")
+        lines.append("")
+
+    lines.append("_Alerts fire once when price crosses your target\\._")
+
+    buttons = [
+        [KeyboardButton(text="➕ New Alert")],
+        [KeyboardButton(text="🗑 Remove Alert")],
+        [KeyboardButton(text="🔙 Back to Menu")],
+    ]
+    await message.answer(
+        "\n".join(lines), parse_mode="MarkdownV2",
+        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+    )
+
+
+@router.message(F.text == "➕ New Alert")
+async def cmd_new_alert_start(message: Message, state: FSMContext):
+    await state.set_state(AddPriceAlert.entering_asset)
+    await message.answer(
+        "Enter the asset symbol \\(e\\.g\\. `BTC`, `ETH`, `SOL`\\):",
+        parse_mode="MarkdownV2", reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddPriceAlert.entering_asset)
+async def new_alert_asset(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    asset = message.text.strip().upper()
+    if not asset.isalpha() or len(asset) > 10:
+        return await message.answer("Enter a valid symbol, e\\.g\\. `BTC`, `ETH`\\.", parse_mode="MarkdownV2")
+    await state.update_data(asset=asset)
+    await state.set_state(AddPriceAlert.entering_direction)
+    buttons = [[KeyboardButton(text="📈 Above"), KeyboardButton(text="📉 Below")], [KeyboardButton(text="❌ Cancel")]]
+    await message.answer(
+        f"Alert when `{md(asset)}` goes *above* or *below* your target?",
+        parse_mode="MarkdownV2",
+        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+    )
+
+
+@router.message(AddPriceAlert.entering_direction)
+async def new_alert_direction(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    if message.text not in ("📈 Above", "📉 Below"):
+        return await message.answer("Please use the buttons.")
+    direction = "above" if message.text == "📈 Above" else "below"
+    await state.update_data(direction=direction)
+    await state.set_state(AddPriceAlert.entering_price)
+    data = await state.get_data()
+    prices = await get_usd_prices([data["asset"]])
+    current = prices.get(data["asset"], 0)
+    current_str = f" \\(currently {fmt_usd(current)}\\)" if current else ""
+    await message.answer(
+        f"Enter the target USD price for `{md(data['asset'])}`{current_str}:",
+        parse_mode="MarkdownV2", reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddPriceAlert.entering_price)
+async def new_alert_price(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    try:
+        price = float(message.text.replace("$", "").replace(",", "").strip())
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer("Enter a valid price, e\\.g\\. `50000` or `0\\.50`\\.", parse_mode="MarkdownV2")
+
+    data = await state.get_data()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            await state.clear()
+            return await message.answer("Please /start first.")
+        db.add(PriceAlert(user_id=user.id, asset=data["asset"], direction=data["direction"], target_usd=price))
+        await db.commit()
+
+    await state.clear()
+    direction_str = "rises above" if data["direction"] == "above" else "drops below"
+    await message.answer(
+        f"✅ Alert set\\! You'll be notified when *{md(data['asset'])}* {md(direction_str)} {fmt_usd(price)}\\.",
+        parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
+    )
+
+
+@router.message(F.text == "🗑 Remove Alert")
+async def cmd_remove_alert(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        if not user:
+            return await message.answer("Please /start first.")
+        result = await db.execute(
+            select(PriceAlert).where(PriceAlert.user_id == user.id, PriceAlert.triggered == False)
+        )
+        alerts = result.scalars().all()
+        if not alerts:
+            return await message.answer("No active alerts.", reply_markup=MAIN_MENU)
+        for a in alerts:
+            await db.delete(a)
+        await db.commit()
+    await message.answer(f"✅ Removed {len(alerts)} alert\\(s\\)\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
 # ── /mywallets ────────────────────────────────────────────────────────────────
@@ -608,7 +1027,7 @@ async def cmd_portfolio(message: Message, state: FSMContext):
 async def cmd_my_wallets(message: Message, state: FSMContext):
     await state.clear()
     async with AsyncSessionLocal() as db:
-        user    = await get_user_by_telegram_id(db, message.from_user.id)
+        user = await get_user_by_telegram_id(db, message.from_user.id)
         wallets = list(user.wallets) if user else []
 
     if not wallets:
@@ -618,21 +1037,24 @@ async def cmd_my_wallets(message: Message, state: FSMContext):
         )
 
     groups = _build_wallet_groups(wallets)
-    lines  = [f"📋 *Your wallets* \\({len(groups)} address{'es' if len(groups)!=1 else ''}\\)\n"]
+    lines = [f"📋 *Your wallets* \\({len(groups)} address{'es' if len(groups)!=1 else ''}\\)", ""]
     for i, g in enumerate(groups, 1):
-        lbl     = md(g["label"]) if g["label"] else "_no label_"
-        chains  = g["chains"]
-        tags    = _chain_tags(chains)
-        names   = md(_chain_names(chains))
-        short   = md(g["address"][:6] + "…" + g["address"][-4:])
-        missing = _evm_chains_not_tracked(chains) if any(
-            CHAIN_CONFIG.get(c, {}).get("type") == "evm" for c in chains
-        ) else []
-        add_hint = f"\n   _\\+ {len(missing)} more EVM chain{'s' if len(missing)!=1 else ''} available_" if missing else ""
-        lines.append(f"{i}\\. {lbl}\n   `{short}`\n   {tags} {names}{add_hint}")
+        lbl = md(g["label"]) if g["label"] else "_no label_"
+        chains = g["chains"]
+        tags = _chain_tags(chains)
+        names = md(_chain_names(chains))
+        short = md(g["address"][:6] + "…" + g["address"][-4:])
+        missing = _evm_chains_not_tracked(chains) if any(CHAIN_CONFIG.get(c, {}).get("type") == "evm" for c in chains) else []
+        lines.append(f"{i}\\. {lbl}")
+        lines.append(f"   `{short}`")
+        lines.append(f"   {tags} {names}")
+        if missing:
+            lines.append(f"   _\\+ {len(missing)} more EVM chain{'s' if len(missing)!=1 else ''} available_")
+        lines.append("")
 
-    lines.append("\n_Use /addchain to track more chains on an existing wallet_")
-    await message.answer("\n\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+    lines.append("_Use /addchain to track more chains on an existing wallet_")
+    lines.append("_Use /editwallet to rename a wallet_")
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
 # ── /myexchanges ──────────────────────────────────────────────────────────────
@@ -642,26 +1064,148 @@ async def cmd_my_wallets(message: Message, state: FSMContext):
 async def cmd_my_exchanges(message: Message, state: FSMContext):
     await state.clear()
     async with AsyncSessionLocal() as db:
-        user      = await get_user_by_telegram_id(db, message.from_user.id)
+        user = await get_user_by_telegram_id(db, message.from_user.id)
         exchanges = list(user.exchanges) if user else []
 
     if not exchanges:
-        return await message.answer(
-            "No exchanges connected\\. Use *➕ Add Exchange*\\.",
-            parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
-        )
+        return await message.answer("No exchanges connected\\. Use *➕ Add Exchange*\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
-    lines = [f"📋 *Your exchanges* \\({len(exchanges)}\\)\n"]
+    lines = [f"📋 *Your exchanges* \\({len(exchanges)}\\)", ""]
     for i, e in enumerate(exchanges, 1):
-        lbl   = md(e.label) if e.label else "_no label_"
+        lbl = md(e.label) if e.label else "_no label_"
         added = md(e.added_at.strftime("%Y-%m-%d") if e.added_at else "unknown")
-        pw    = " \\+ passphrase" if e.api_password else ""
-        lines.append(f"{i}\\. {bold(e.exchange_id.upper())}\n   {lbl}\n   Added: {added}{md(pw)}")
-    lines.append("\n_API keys stored encrypted\\._")
-    await message.answer("\n\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        pw = " \\+ passphrase" if e.api_password else ""
+        lines.append(f"{i}\\. {bold(e.exchange_id.upper())}")
+        lines.append(f"   {lbl}")
+        lines.append(f"   Added: {added}{md(pw)}")
+        lines.append("")
+
+    lines.append("_Use /editexchange to rename, /updateexchange to update keys_")
+    lines.append("_API keys stored encrypted\\._")
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /addwallet ────────────────────────────────────────────────────────────────
+# ── Edit wallet label ─────────────────────────────────────────────────────────
+
+@router.message(Command("editwallet"))
+@router.message(F.text == "✏️ Edit Wallet")
+async def cmd_edit_wallet_start(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        wallets = list(user.wallets) if user else []
+    if not wallets:
+        return await message.answer("No wallets to edit\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+    groups = _build_wallet_groups(wallets)
+    lines = ["Choose a wallet to rename:", ""]
+    buttons = []
+    for i, g in enumerate(groups, 1):
+        lbl = g["label"] or (g["address"][:6] + "…" + g["address"][-4:])
+        tags = _chain_tags(g["chains"])
+        lines.append(f"{i}\\. {tags} {md(lbl)}")
+        buttons.append([KeyboardButton(text=str(i))])
+    buttons.append([KeyboardButton(text="❌ Cancel")])
+    await state.set_state(EditWalletLabel.choosing_wallet)
+    await state.update_data(groups=[(g["address"], g["ids"]) for g in groups])
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
+
+
+@router.message(EditWalletLabel.choosing_wallet)
+async def edit_wallet_pick(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    data = await state.get_data()
+    try:
+        idx = int(message.text) - 1
+        address, ids = data["groups"][idx]
+    except (ValueError, IndexError):
+        return await message.answer("Invalid choice.")
+    await state.update_data(target_ids=ids)
+    await state.set_state(EditWalletLabel.entering_label)
+    await message.answer(
+        f"Enter a new label for `{md(address[:6])}…{md(address[-4:])}`, or /skip to clear it:",
+        parse_mode="MarkdownV2", reply_markup=cancel_kb(),
+    )
+
+
+@router.message(EditWalletLabel.entering_label)
+async def edit_wallet_label_save(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    label = None if message.text.strip() in ("/skip", "skip") else message.text.strip()[:64]
+    data = await state.get_data()
+    async with AsyncSessionLocal() as db:
+        for wid in data["target_ids"]:
+            result = await db.execute(select(Wallet).where(Wallet.id == wid))
+            w = result.scalar_one_or_none()
+            if w:
+                w.label = label
+        await db.commit()
+    await state.clear()
+    lbl_str = md(label) if label else "_cleared_"
+    await message.answer(f"✅ Label updated: {lbl_str}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── Edit exchange label ────────────────────────────────────────────────────────
+
+@router.message(Command("editexchange"))
+@router.message(F.text == "✏️ Edit Exchange")
+async def cmd_edit_exchange_start(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        exchanges = list(user.exchanges) if user else []
+    if not exchanges:
+        return await message.answer("No exchanges to edit\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+    lines = ["Choose an exchange to rename:", ""]
+    buttons = []
+    for i, e in enumerate(exchanges, 1):
+        lines.append(f"{i}\\. {md(e.label or e.exchange_id.upper())}")
+        buttons.append([KeyboardButton(text=str(i))])
+    buttons.append([KeyboardButton(text="❌ Cancel")])
+    await state.set_state(EditExchangeLabel.choosing_exchange)
+    await state.update_data(exchange_ids=[e.id for e in exchanges])
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
+
+
+@router.message(EditExchangeLabel.choosing_exchange)
+async def edit_exchange_pick(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    data = await state.get_data()
+    try:
+        eid = data["exchange_ids"][int(message.text) - 1]
+    except (ValueError, IndexError):
+        return await message.answer("Invalid choice.")
+    await state.update_data(target_id=eid)
+    await state.set_state(EditExchangeLabel.entering_label)
+    await message.answer("Enter a new label, or /skip to clear it:", reply_markup=cancel_kb())
+
+
+@router.message(EditExchangeLabel.entering_label)
+async def edit_exchange_label_save(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    label = None if message.text.strip() in ("/skip", "skip") else message.text.strip()[:64]
+    data = await state.get_data()
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Exchange).where(Exchange.id == data["target_id"]))
+        exch = result.scalar_one_or_none()
+        if exch:
+            exch.label = label
+        await db.commit()
+    await state.clear()
+    lbl_str = md(label) if label else "_cleared_"
+    await message.answer(f"✅ Label updated: {lbl_str}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── Add Wallet ────────────────────────────────────────────────────────────────
 
 @router.message(Command("addwallet"))
 @router.message(F.text == "➕ Add Wallet")
@@ -672,135 +1216,120 @@ async def cmd_add_wallet_start(message: Message, state: FSMContext):
         "📋 *Add a wallet*\n\n"
         "Paste your wallet address:\n"
         "  • `0x…` — ETH, BNB, Polygon, Arbitrum, Optimism, Base, Avalanche\n"
-        "  • Solana address \\(32–44 chars\\)\n"
-        "  • Bitcoin address \\(starts with 1, 3, or bc1\\)\n\n"
-        "_One 0x address covers all EVM chains\\. Use /cancel to go back\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=cancel_kb(),
+        "  • Solana \\(32–44 chars\\)\n"
+        "  • Bitcoin \\(starts with 1, 3, or bc1\\)",
+        parse_mode="MarkdownV2", reply_markup=cancel_kb(),
     )
+
 
 @router.message(AddWallet.entering_address)
 async def add_wallet_address(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-
-    address   = message.text.strip()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    address = message.text.strip()
     addr_type = detect_address_type(address)
-
     if len(address) < 26 or addr_type == "unknown":
-        return await message.answer(
-            "⚠️ Could not recognise this address\\. Try again or /cancel\\.",
-            parse_mode="MarkdownV2",
-        )
+        return await message.answer("⚠️ Unrecognised address\\. Try again or /cancel\\.", parse_mode="MarkdownV2")
 
     if addr_type == "evm":
         async with AsyncSessionLocal() as db:
-            user    = await get_user_by_telegram_id(db, message.from_user.id)
+            user = await get_user_by_telegram_id(db, message.from_user.id)
             already = [w.chain for w in user.wallets if w.address.lower() == address.lower()] if user else []
-
         await state.update_data(address=address, addr_type="evm", selected_chains=[], already_tracked=already)
         await state.set_state(AddWallet.choosing_chains)
         await _show_evm_chain_picker(message, address, already_tracked=already, selected=[])
-
     elif addr_type == "solana":
         await state.update_data(address=address, addr_type="solana", chain="solana")
         await state.set_state(AddWallet.entering_label)
-        await message.answer(
-            f"◎ *Solana* address detected\\.\n`{md(address[:16])}…`\n\nGive it a label, or /skip:",
-            parse_mode="MarkdownV2", reply_markup=cancel_kb(),
-        )
+        await message.answer("◎ *Solana* detected\\. Give it a label, or /skip:", parse_mode="MarkdownV2", reply_markup=cancel_kb())
     elif addr_type == "bitcoin":
         await state.update_data(address=address, addr_type="bitcoin", chain="bitcoin")
         await state.set_state(AddWallet.entering_label)
-        await message.answer(
-            f"₿ *Bitcoin* address detected\\.\n`{md(address[:16])}…`\n\nGive it a label, or /skip:",
-            parse_mode="MarkdownV2", reply_markup=cancel_kb(),
-        )
+        await message.answer("₿ *Bitcoin* detected\\. Give it a label, or /skip:", parse_mode="MarkdownV2", reply_markup=cancel_kb())
+
 
 async def _show_evm_chain_picker(message: Message, address: str, already_tracked: list, selected: list):
     buttons = []
     for c in EVM_CHAINS:
-        cfg   = CHAIN_CONFIG[c]
+        cfg = CHAIN_CONFIG[c]
         label = f"{cfg['emoji']} {cfg['label']}"
-        if c in already_tracked: label += " ✅"
-        elif c in selected:       label += " 🔘"
+        if c in already_tracked:
+            label += " ✅"
+        elif c in selected:
+            label += " 🔘"
         buttons.append([KeyboardButton(text=label)])
     buttons += [
         [KeyboardButton(text="🌐 All new EVM chains")],
         [KeyboardButton(text="✅ Done — save selected")],
         [KeyboardButton(text="❌ Cancel")],
     ]
-    already_note  = f"\n_Already tracking: {md(_chain_names(already_tracked))}_" if already_tracked else ""
+    already_note = f"\n_Already tracking: {md(_chain_names(already_tracked))}_" if already_tracked else ""
     selected_note = md(_chain_names(selected)) if selected else "none"
     await message.answer(
         f"EVM address: `{md(address[:6])}…{md(address[-4:])}`{already_note}\n"
-        f"Selected: {selected_note}\n_Tap to toggle, then Done\\. Use /cancel to abort\\._",
+        f"Selected: {selected_note}\n_Tap to toggle, then Done_",
         parse_mode="MarkdownV2",
         reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
     )
 
+
 @router.message(AddWallet.choosing_chains)
 async def add_wallet_choose_chains(message: Message, state: FSMContext):
-    text     = message.text
-    data     = await state.get_data()
-    selected: list = data.get("selected_chains", [])
-    already: list  = data.get("already_tracked", [])
-    address: str   = data["address"]
+    text = message.text
+    data = await state.get_data()
+    selected = data.get("selected_chains", [])
+    already = data.get("already_tracked", [])
+    address = data["address"]
 
     if text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     if text == "🌐 All new EVM chains":
         selected = [c for c in EVM_CHAINS if c not in already]
         if not selected:
             return await message.answer("All EVM chains already tracked\\.", parse_mode="MarkdownV2")
         await state.update_data(selected_chains=selected)
         await state.set_state(AddWallet.entering_label)
-        return await message.answer(
-            f"✅ All {len(selected)} new EVM chains selected\\.\n\nGive a label, or /skip:",
-            parse_mode="MarkdownV2", reply_markup=cancel_kb(),
-        )
-
+        return await message.answer(f"✅ All {len(selected)} new chains selected\\. Give a label, or /skip:", parse_mode="MarkdownV2", reply_markup=cancel_kb())
     if text == "✅ Done — save selected":
         if not selected:
             return await message.answer("Select at least one chain\\.", parse_mode="MarkdownV2")
         await state.update_data(selected_chains=selected)
         await state.set_state(AddWallet.entering_label)
-        return await message.answer(
-            f"✅ {md(_chain_names(selected))} selected\\.\n\nGive a label, or /skip:",
-            parse_mode="MarkdownV2", reply_markup=cancel_kb(),
-        )
+        return await message.answer(f"✅ {md(_chain_names(selected))} selected\\. Give a label, or /skip:", parse_mode="MarkdownV2", reply_markup=cancel_kb())
 
     clean = text.replace(" ✅", "").replace(" 🔘", "").strip()
     chain = _EVM_LABEL_TO_CHAIN.get(clean)
     if chain:
         if chain in already:
             return await message.answer(f"{CHAIN_CONFIG[chain]['emoji']} Already tracked\\.", parse_mode="MarkdownV2")
-        if chain in selected: selected.remove(chain)
-        else: selected.append(chain)
+        if chain in selected:
+            selected.remove(chain)
+        else:
+            selected.append(chain)
         await state.update_data(selected_chains=selected)
         await _show_evm_chain_picker(message, address, already_tracked=already, selected=selected)
     else:
-        await message.answer("Please use the buttons\\. Use /cancel to abort\\.", parse_mode="MarkdownV2")
+        await message.answer("Please use the buttons.")
+
 
 @router.message(AddWallet.entering_label)
 async def add_wallet_label(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-    label     = None if message.text.strip() in ("/skip", "skip") else message.text.strip()[:64]
-    data      = await state.get_data()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    label = None if message.text.strip() in ("/skip", "skip") else message.text.strip()[:64]
+    data = await state.get_data()
     addr_type = data["addr_type"]
-    address   = data["address"]
-    chains    = data.get("selected_chains", []) if addr_type == "evm" else [data["chain"]]
+    address = data["address"]
+    chains = data.get("selected_chains", []) if addr_type == "evm" else [data["chain"]]
     added, skipped = [], []
     async with AsyncSessionLocal() as db:
         user = await get_user_by_telegram_id(db, message.from_user.id)
         if not user:
             await state.clear()
-            return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+            return await message.answer("Please /start first.")
         for chain in chains:
             if await get_wallet_exists(db, user.id, chain, address):
                 skipped.append(CHAIN_CONFIG[chain]["label"])
@@ -808,40 +1337,42 @@ async def add_wallet_label(message: Message, state: FSMContext):
                 db.add(Wallet(user_id=user.id, chain=chain, address=address, label=label))
                 added.append(CHAIN_CONFIG[chain]["label"])
         await db.commit()
+
     await state.clear()
     parts = []
-    if added:   parts.append(f"✅ Added on: {md(', '.join(added))}")
-    if skipped: parts.append(f"⚠️ Already tracked: {md(', '.join(skipped))}")
+    if added:
+        parts.append(f"✅ Added on: {md(', '.join(added))}")
+    if skipped:
+        parts.append(f"⚠️ Already tracked: {md(', '.join(skipped))}")
     lbl_str = md(label) if label else "_no label_"
-    await message.answer(
-        f"`{md(address[:6])}…{md(address[-4:])}`\n" + "\n".join(parts) + f"\nLabel: {lbl_str}",
-        parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
-    )
+    short = md(address[:6] + "…" + address[-4:])
+    msg_lines = [f"`{short}`"] + parts + [f"Label: {lbl_str}", "", "_Use /addchain to track more chains later\\._"]
+    await message.answer("\n".join(msg_lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /addchain ─────────────────────────────────────────────────────────────────
+# ── Add chain to existing wallet ───────────────────────────────────────────────
 
 @router.message(Command("addchain"))
 @router.message(F.text == "➕ Add Chain")
 async def cmd_add_chain_start(message: Message, state: FSMContext):
     await state.clear()
     async with AsyncSessionLocal() as db:
-        user    = await get_user_by_telegram_id(db, message.from_user.id)
+        user = await get_user_by_telegram_id(db, message.from_user.id)
         wallets = list(user.wallets) if user else []
     if not wallets:
         return await message.answer("No wallets yet\\. Use *➕ Add Wallet* first\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-    groups     = _build_wallet_groups(wallets)
-    expandable = [g for g in groups
-                  if any(CHAIN_CONFIG.get(c, {}).get("type") == "evm" for c in g["chains"])
-                  and _evm_chains_not_tracked(g["chains"])]
+
+    groups = _build_wallet_groups(wallets)
+    expandable = [
+        g for g in groups
+        if any(CHAIN_CONFIG.get(c, {}).get("type") == "evm" for c in g["chains"]) and _evm_chains_not_tracked(g["chains"])
+    ]
     if not expandable:
-        return await message.answer(
-            "All EVM wallets already track all chains\\. Use *➕ Add Wallet* for a new address\\.",
-            parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
-        )
-    lines, buttons = ["Choose a wallet to add chains to:\n"], []
+        return await message.answer("All EVM wallets track all available chains\\. Use *➕ Add Wallet* for a new address\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+    lines, buttons = ["Choose a wallet to add chains to:", ""], []
     for i, g in enumerate(expandable, 1):
-        lbl   = g["label"] or (g["address"][:6] + "…" + g["address"][-4:])
+        lbl = g["label"] or (g["address"][:6] + "…" + g["address"][-4:])
         missing_count = len(_evm_chains_not_tracked(g["chains"]))
         lines.append(f"{i}\\. {_chain_tags(g['chains'])} {md(lbl)} _\\({missing_count} available\\)_")
         buttons.append([KeyboardButton(text=str(i))])
@@ -850,33 +1381,35 @@ async def cmd_add_chain_start(message: Message, state: FSMContext):
     await state.update_data(expandable_groups=[(g["address"], g["chains"], g["label"]) for g in expandable])
     await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
 
+
 @router.message(AddChainToWallet.choosing_wallet)
 async def add_chain_pick_wallet(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     data = await state.get_data()
     try:
         idx = int(message.text) - 1
         address, tracked, label = data["expandable_groups"][idx]
     except (ValueError, IndexError):
-        return await message.answer("Invalid choice\\. Use the buttons\\.", parse_mode="MarkdownV2")
+        return await message.answer("Invalid choice.")
     await state.update_data(target_address=address, already_tracked=tracked, wallet_label=label, selected_chains=[])
     await state.set_state(AddChainToWallet.choosing_chains)
     await _show_evm_chain_picker(message, address, already_tracked=tracked, selected=[])
 
+
 @router.message(AddChainToWallet.choosing_chains)
 async def add_chain_pick_chains(message: Message, state: FSMContext):
-    text     = message.text
-    data     = await state.get_data()
-    selected: list = data.get("selected_chains", [])
-    already: list  = data["already_tracked"]
-    address: str   = data["target_address"]
-    label          = data.get("wallet_label")
+    text = message.text
+    data = await state.get_data()
+    selected = data.get("selected_chains", [])
+    already = data["already_tracked"]
+    address = data["target_address"]
+    label = data.get("wallet_label")
 
     if text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     if text == "🌐 All new EVM chains":
         selected = [c for c in EVM_CHAINS if c not in already]
         if not selected:
@@ -888,17 +1421,21 @@ async def add_chain_pick_chains(message: Message, state: FSMContext):
             return await message.answer("Select at least one chain\\.", parse_mode="MarkdownV2")
         await _save_new_chains(message, state, address, selected, label)
         return
+
     clean = text.replace(" ✅", "").replace(" 🔘", "").strip()
     chain = _EVM_LABEL_TO_CHAIN.get(clean)
     if chain:
         if chain in already:
             return await message.answer(f"{CHAIN_CONFIG[chain]['emoji']} Already tracked\\.", parse_mode="MarkdownV2")
-        if chain in selected: selected.remove(chain)
-        else: selected.append(chain)
+        if chain in selected:
+            selected.remove(chain)
+        else:
+            selected.append(chain)
         await state.update_data(selected_chains=selected)
         await _show_evm_chain_picker(message, address, already_tracked=already, selected=selected)
     else:
-        await message.answer("Please use the buttons\\.", parse_mode="MarkdownV2")
+        await message.answer("Please use the buttons.")
+
 
 async def _save_new_chains(message: Message, state: FSMContext, address: str, chains: list, label):
     added = []
@@ -906,7 +1443,7 @@ async def _save_new_chains(message: Message, state: FSMContext, address: str, ch
         user = await get_user_by_telegram_id(db, message.from_user.id)
         if not user:
             await state.clear()
-            return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+            return await message.answer("Please /start first.")
         for chain in chains:
             if not await get_wallet_exists(db, user.id, chain, address):
                 db.add(Wallet(user_id=user.id, chain=chain, address=address, label=label))
@@ -920,67 +1457,70 @@ async def _save_new_chains(message: Message, state: FSMContext, address: str, ch
         await message.answer("No new chains added \\(all already tracked\\)\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /removewallet ─────────────────────────────────────────────────────────────
+# ── Remove Wallet ─────────────────────────────────────────────────────────────
 
 @router.message(Command("removewallet"))
 @router.message(F.text == "🗑 Remove Wallet")
 async def cmd_remove_wallet(message: Message, state: FSMContext):
     await state.clear()
     async with AsyncSessionLocal() as db:
-        user    = await get_user_by_telegram_id(db, message.from_user.id)
+        user = await get_user_by_telegram_id(db, message.from_user.id)
         wallets = list(user.wallets) if user else []
     if not wallets:
-        return await message.answer("You have no wallets to remove\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-    groups  = _build_wallet_groups(wallets)
-    lines   = ["Choose a wallet to remove:\n"]
-    buttons = []
+        return await message.answer("No wallets to remove.", reply_markup=MAIN_MENU)
+
+    groups = _build_wallet_groups(wallets)
+    lines, buttons = ["Choose a wallet to remove:", ""], []
     for i, g in enumerate(groups, 1):
         lbl = g["label"] or (g["address"][:6] + "…" + g["address"][-4:])
-        lines.append(f"{i}\\. {_chain_tags(g['chains'])} {md(lbl)}\n   {md(_chain_names(g['chains']))}")
+        lines.append(f"{i}\\. {_chain_tags(g['chains'])} {md(lbl)}")
+        lines.append(f"   {md(_chain_names(g['chains']))}")
         buttons.append([KeyboardButton(text=str(i))])
     buttons.append([KeyboardButton(text="❌ Cancel")])
     await state.set_state(RemovingWallet.choosing_wallet)
     await state.update_data(groups=[(g["address"], g["chains"], g["ids"], g["label"]) for g in groups])
     await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
 
+
 @router.message(RemovingWallet.choosing_wallet)
 async def remove_wallet_pick(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     data = await state.get_data()
     try:
         idx = int(message.text) - 1
         address, chains, ids, label = data["groups"][idx]
     except (ValueError, IndexError):
-        return await message.answer("Invalid choice\\. Use the buttons\\.", parse_mode="MarkdownV2")
+        return await message.answer("Invalid choice.")
     await state.update_data(target_address=address, target_chains=chains, target_ids=ids)
     await state.set_state(RemovingWallet.choosing_action)
     lbl_str = md(label) if label else md(address[:6] + "…" + address[-4:])
+
     if len(chains) == 1:
         buttons = [[KeyboardButton(text="🗑 Yes, remove it")], [KeyboardButton(text="❌ Cancel")]]
-        await message.answer(
-            f"Remove {bold(lbl_str)} on {md(CHAIN_CONFIG.get(chains[0], {}).get('label', chains[0]))}?",
-            parse_mode="MarkdownV2",
-            reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
-        )
+        chain_label = md(CHAIN_CONFIG.get(chains[0], {}).get("label", chains[0]))
+        await message.answer(f"Remove {bold(lbl_str)} on {chain_label}?", parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
     else:
         chain_buttons = [[KeyboardButton(text=f"Remove {CHAIN_CONFIG[c]['emoji']} {CHAIN_CONFIG[c]['label']} only")] for c in chains]
         chain_buttons += [[KeyboardButton(text="🗑 Remove ALL chains")], [KeyboardButton(text="❌ Cancel")]]
+        tags = _chain_tags(chains)
+        names = md(_chain_names(chains))
         await message.answer(
-            f"{_chain_tags(chains)} {bold(lbl_str)}\n{md(_chain_names(chains))}\n\nRemove which chain\\(s\\)?",
+            f"{tags} {bold(lbl_str)}\n{names}\n\nRemove which chain\\(s\\)?",
             parse_mode="MarkdownV2",
             reply_markup=ReplyKeyboardMarkup(keyboard=chain_buttons, resize_keyboard=True),
         )
+
 
 @router.message(RemovingWallet.choosing_action)
 async def remove_wallet_action(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-    data   = await state.get_data()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    data = await state.get_data()
     chains = data["target_chains"]
-    ids    = data["target_ids"]
+    ids = data["target_ids"]
     chains_to_remove = []
     if message.text in ("🗑 Yes, remove it", "🗑 Remove ALL chains"):
         chains_to_remove = list(chains)
@@ -991,10 +1531,11 @@ async def remove_wallet_action(message: Message, state: FSMContext):
                 chains_to_remove = [c]
                 break
     if not chains_to_remove:
-        return await message.answer("Invalid choice\\. Use the buttons\\.", parse_mode="MarkdownV2")
+        return await message.answer("Invalid choice. Use the buttons.")
+
     async with AsyncSessionLocal() as db:
-        result  = await db.execute(select(Wallet).where(Wallet.id.in_(ids)))
-        rows    = result.scalars().all()
+        result = await db.execute(select(Wallet).where(Wallet.id.in_(ids)))
+        rows = result.scalars().all()
         removed = []
         for w in rows:
             if w.chain in chains_to_remove:
@@ -1002,99 +1543,118 @@ async def remove_wallet_action(message: Message, state: FSMContext):
                 removed.append(CHAIN_CONFIG.get(w.chain, {}).get("label", w.chain))
         await db.commit()
     await state.clear()
-    await message.answer(
-        f"✅ Removed: {md(', '.join(removed))}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU
-    )
+    await message.answer(f"✅ Removed: {md(', '.join(removed))}", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /addexchange ──────────────────────────────────────────────────────────────
+# ── Add Exchange ──────────────────────────────────────────────────────────────
 
 @router.message(Command("addexchange"))
 @router.message(F.text == "➕ Add Exchange")
 async def cmd_add_exchange_start(message: Message, state: FSMContext):
     await state.clear()
     ex_list = list(SUPPORTED_EXCHANGES.keys())
-    rows    = [ex_list[i:i+3] for i in range(0, len(ex_list), 3)]
+    rows = [ex_list[i:i+3] for i in range(0, len(ex_list), 3)]
     buttons = [[KeyboardButton(text=e.capitalize()) for e in row] for row in rows]
     buttons.append([KeyboardButton(text="❌ Cancel")])
     await state.set_state(AddExchange.choosing_exchange)
-    await message.answer(
-        "Which exchange do you want to connect?\n\n"
-        "_I'll show step\\-by\\-step how to create a read\\-only API key\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+    await message.answer("Which exchange?", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
+
+
+def _build_ip_block() -> str:
+    """Return a MarkdownV2 block showing the server IP(s) to whitelist."""
+    server_ip = get_server_ip()
+    if not server_ip:
+        return "🌐 *Server IP:* Use /serverip after the bot starts to get it\\.\n\n"
+    ip_parts = [f"`{md(ip.strip())}`" for ip in server_ip.split(",") if ip.strip()]
+    ip_joined = " / ".join(ip_parts)
+    return (
+        "🌐 *Your server IP \\(whitelist before creating key\\):*\n"
+        + ip_joined + "\n"
+        + "_Add this IP in the API restriction settings\\._\n\n"
     )
+
 
 @router.message(AddExchange.choosing_exchange)
 async def add_exchange_choice(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     exchange_id = message.text.lower().strip()
     if exchange_id not in SUPPORTED_EXCHANGES:
-        return await message.answer("Please choose one of the buttons\\.", parse_mode="MarkdownV2")
+        return await message.answer("Please choose one of the buttons.")
     await state.update_data(exchange_id=exchange_id)
     await state.set_state(AddExchange.entering_key)
+
     guide_url, steps = EXCHANGE_GUIDES.get(exchange_id, ("", "Create a read-only API key on the exchange website."))
-    await message.answer(
-        f"🔑 *{md(exchange_id.upper())} read\\-only API key setup*\n\n{md(steps)}\n\n"
-        f"🔗 [Open API settings]({guide_url})\n\n"
-        f"⚠️ *READ ONLY* — never enable withdrawals or trading\\.\n\n"
-        f"Paste your *API Key*:",
-        parse_mode="MarkdownV2", reply_markup=ReplyKeyboardRemove(),
+    ip_block = _build_ip_block()
+
+    msg = (
+        "🔑 *" + md(exchange_id.upper()) + " API key setup*\n\n"
+        + ip_block
+        + "*Steps:*\n" + md(steps) + "\n\n"
+        + "🔗 [Open API settings](" + guide_url + ")\n\n"
+        + "⚠️ *READ ONLY* \\- never enable withdrawals or trading\\.\n\n"
+        + "Now paste your *API Key*:"
     )
+    await message.answer(msg, parse_mode="MarkdownV2", reply_markup=ReplyKeyboardRemove())
+
 
 @router.message(AddExchange.entering_key)
 async def add_exchange_key(message: Message, state: FSMContext):
     await state.update_data(api_key=message.text.strip())
-    try: await message.delete()
-    except Exception: pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
     await state.set_state(AddExchange.entering_secret)
-    await message.answer("✅ Key received \\(deleted from chat\\)\\. Paste your *API Secret*:", parse_mode="MarkdownV2")
+    await message.answer("✅ Key received \\(deleted\\)\\. Paste your *API Secret*:", parse_mode="MarkdownV2")
+
 
 @router.message(AddExchange.entering_secret)
 async def add_exchange_secret(message: Message, state: FSMContext):
     await state.update_data(api_secret=message.text.strip())
-    try: await message.delete()
-    except Exception: pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
     data = await state.get_data()
     if data["exchange_id"] in EXCHANGES_NEEDING_PASSWORD:
         await state.set_state(AddExchange.entering_password)
-        await message.answer(f"✅ Secret received\\. *{md(data['exchange_id'].upper())}* also needs your *Passphrase*:", parse_mode="MarkdownV2")
+        await message.answer("✅ Secret received\\. Enter your *Passphrase*:", parse_mode="MarkdownV2")
     else:
         await state.set_state(AddExchange.entering_label)
         await message.answer("✅ Secret received\\. Give this a label, or /skip:", parse_mode="MarkdownV2")
 
+
 @router.message(AddExchange.entering_password)
 async def add_exchange_password(message: Message, state: FSMContext):
     await state.update_data(api_password=message.text.strip())
-    try: await message.delete()
-    except Exception: pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
     await state.set_state(AddExchange.entering_label)
     await message.answer("✅ Passphrase received\\. Give this a label, or /skip:", parse_mode="MarkdownV2")
+
 
 @router.message(AddExchange.entering_label)
 async def add_exchange_label(message: Message, state: FSMContext):
     label = None if message.text.strip() in ("/skip", "skip") else message.text.strip()[:64]
-    data  = await state.get_data()
+    data = await state.get_data()
     async with AsyncSessionLocal() as db:
         user = await get_user_by_telegram_id(db, message.from_user.id)
         if not user:
             await state.clear()
-            return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+            return await message.answer("Please /start first.")
 
-        # Check for duplicate exchange connection
         existing = await db.execute(
-            select(Exchange).where(
-                Exchange.user_id == user.id,
-                Exchange.exchange_id == data["exchange_id"],
-            )
+            select(Exchange).where(Exchange.user_id == user.id, Exchange.exchange_id == data["exchange_id"])
         )
         if existing.scalar_one_or_none():
             await state.clear()
             return await message.answer(
                 f"⚠️ *{md(data['exchange_id'].upper())}* is already connected\\.\n"
-                f"Use *🗑 Remove Exchange* first if you want to update the keys\\.",
+                f"Use *🔄 Update Exchange* to change its keys, or *🗑 Remove Exchange* first\\.",
                 parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
             )
 
@@ -1104,27 +1664,25 @@ async def add_exchange_label(message: Message, state: FSMContext):
             api_password=encrypt(data["api_password"]) if data.get("api_password") else None,
         ))
         await db.commit()
+
     await state.clear()
     lbl_str = md(label) if label else "_no label_"
-    await message.answer(
-        f"✅ *{md(data['exchange_id'].upper())}* connected\\! {lbl_str}\n_Keys encrypted at rest\\._",
-        parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
-    )
+    await message.answer(f"✅ *{md(data['exchange_id'].upper())}* connected\\! {lbl_str}\n_Keys encrypted at rest\\._", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
 
 
-# ── /removeexchange ───────────────────────────────────────────────────────────
+# ── Remove Exchange ───────────────────────────────────────────────────────────
 
 @router.message(Command("removeexchange"))
 @router.message(F.text == "🗑 Remove Exchange")
 async def cmd_remove_exchange(message: Message, state: FSMContext):
     await state.clear()
     async with AsyncSessionLocal() as db:
-        user      = await get_user_by_telegram_id(db, message.from_user.id)
+        user = await get_user_by_telegram_id(db, message.from_user.id)
         exchanges = list(user.exchanges) if user else []
     if not exchanges:
-        return await message.answer("No exchanges connected\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
-    lines   = ["Choose an exchange to disconnect:\n"]
-    buttons = []
+        return await message.answer("No exchanges connected.", reply_markup=MAIN_MENU)
+
+    lines, buttons = ["Choose an exchange to disconnect:", ""], []
     for i, e in enumerate(exchanges, 1):
         lines.append(f"{i}\\. {md(e.label or e.exchange_id.upper())}")
         buttons.append([KeyboardButton(text=str(i))])
@@ -1133,27 +1691,208 @@ async def cmd_remove_exchange(message: Message, state: FSMContext):
     await state.update_data(exchange_ids=[e.id for e in exchanges])
     await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
 
+
 @router.message(RemovingExchange.waiting_for_choice)
 async def remove_exchange_choice(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
         await state.clear()
-        return await message.answer("Cancelled\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
     data = await state.get_data()
     try:
         eid = data["exchange_ids"][int(message.text) - 1]
     except (ValueError, IndexError):
-        return await message.answer("Invalid choice\\.", parse_mode="MarkdownV2")
+        return await message.answer("Invalid choice.")
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Exchange).where(Exchange.id == eid))
-        exch   = result.scalar_one_or_none()
+        exch = result.scalar_one_or_none()
         if exch:
             await db.delete(exch)
             await db.commit()
     await state.clear()
-    await message.answer("✅ Exchange disconnected\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+    await message.answer("✅ Exchange disconnected.", reply_markup=MAIN_MENU)
 
 
-# ── /settings ────────────────────────────────────────────────────────────────
+# ── Update Exchange — re-enter API keys after IP whitelisting ────────────────
+
+@router.message(Command("updateexchange"))
+@router.message(F.text == "🔄 Update Exchange")
+async def cmd_update_exchange_start(message: Message, state: FSMContext):
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_telegram_id(db, message.from_user.id)
+        exchanges = list(user.exchanges) if user else []
+
+    if not exchanges:
+        return await message.answer(
+            "No exchanges connected yet\\. Use *➕ Add Exchange* first\\.",
+            parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
+        )
+
+    server_ip = get_server_ip()
+    ip_note = ""
+    if server_ip:
+        ip_parts = " / ".join(f"`{md(ip.strip())}`" for ip in server_ip.split(",") if ip.strip())
+        ip_note = "\n_Server IP to whitelist: " + ip_parts + "_"
+
+    lines = ["Choose an exchange to update:" + ip_note, ""]
+    buttons = []
+    for i, e in enumerate(exchanges, 1):
+        lines.append(f"{i}\\. {md(e.label or e.exchange_id.upper())}")
+        buttons.append([KeyboardButton(text=str(i))])
+    buttons.append([KeyboardButton(text="❌ Cancel")])
+
+    await state.set_state(UpdatingExchange.choosing_exchange)
+    await state.update_data(
+        exchange_ids=[e.id for e in exchanges],
+        exchange_names=[e.exchange_id for e in exchanges],
+        exchange_labels=[e.label for e in exchanges],
+    )
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
+
+
+@router.message(UpdatingExchange.choosing_exchange)
+async def update_exchange_pick(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+    data = await state.get_data()
+    try:
+        idx = int(message.text) - 1
+        exchange_id = data["exchange_ids"][idx]
+        exchange_name = data["exchange_names"][idx]
+        exchange_label = data["exchange_labels"][idx]
+    except (ValueError, IndexError):
+        return await message.answer("Invalid choice.")
+
+    await state.update_data(target_id=exchange_id, target_name=exchange_name)
+    lbl = exchange_label or exchange_name.upper()
+
+    server_ip = get_server_ip()
+    ip_note = ""
+    if server_ip:
+        ip_parts = " / ".join(f"`{md(ip.strip())}`" for ip in server_ip.split(",") if ip.strip())
+        ip_note = "\n\n🌐 *Server IP to whitelist:* " + ip_parts
+
+    buttons = [
+        [KeyboardButton(text="🔑 Update API Keys")],
+        [KeyboardButton(text="🗑 Delete This Exchange")],
+        [KeyboardButton(text="🌐 Show Server IP")],
+        [KeyboardButton(text="❌ Cancel")],
+    ]
+    await state.set_state(UpdatingExchange.choosing_action)
+    await message.answer(
+        f"*{md(lbl)}* — what would you like to do?{ip_note}",
+        parse_mode="MarkdownV2",
+        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+    )
+
+
+@router.message(UpdatingExchange.choosing_action)
+async def update_exchange_action(message: Message, state: FSMContext):
+    data = await state.get_data()
+    name = data["target_name"]
+
+    if message.text == "❌ Cancel":
+        await state.clear()
+        return await message.answer("Cancelled.", reply_markup=MAIN_MENU)
+
+    if message.text == "🌐 Show Server IP":
+        return await cmd_server_ip(message, state)
+
+    if message.text == "🗑 Delete This Exchange":
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Exchange).where(Exchange.id == data["target_id"]))
+            exch = result.scalar_one_or_none()
+            if exch:
+                await db.delete(exch)
+                await db.commit()
+        await state.clear()
+        await message.answer("✅ Exchange deleted\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+        return
+
+    if message.text == "🔑 Update API Keys":
+        guide_url, steps = EXCHANGE_GUIDES.get(name, ("", "Create a read-only API key on the exchange website."))
+        ip_block = _build_ip_block()
+        await state.set_state(UpdatingExchange.entering_key)
+        msg = (
+            "🔑 *Update " + md(name.upper()) + " API keys*\n\n"
+            + ip_block
+            + md(steps) + "\n\n"
+            + "🔗 [Open API settings](" + guide_url + ")\n\n"
+            + "Paste your new *API Key*:"
+        )
+        await message.answer(msg, parse_mode="MarkdownV2", reply_markup=ReplyKeyboardRemove())
+        return
+
+    await message.answer("Please use the buttons.")
+
+
+@router.message(UpdatingExchange.entering_key)
+async def update_exchange_key(message: Message, state: FSMContext):
+    await state.update_data(new_api_key=message.text.strip())
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await state.set_state(UpdatingExchange.entering_secret)
+    await message.answer("✅ Key received \\(deleted\\)\\. Paste your new *API Secret*:", parse_mode="MarkdownV2")
+
+
+@router.message(UpdatingExchange.entering_secret)
+async def update_exchange_secret(message: Message, state: FSMContext):
+    await state.update_data(new_api_secret=message.text.strip())
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    if data["target_name"] in EXCHANGES_NEEDING_PASSWORD:
+        await state.set_state(UpdatingExchange.entering_password)
+        await message.answer("✅ Secret received\\. Enter your new *Passphrase*:", parse_mode="MarkdownV2")
+    else:
+        await _save_updated_exchange(message, state)
+
+
+@router.message(UpdatingExchange.entering_password)
+async def update_exchange_password(message: Message, state: FSMContext):
+    await state.update_data(new_api_password=message.text.strip())
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await _save_updated_exchange(message, state)
+
+
+async def _save_updated_exchange(message: Message, state: FSMContext):
+    data = await state.get_data()
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Exchange).where(Exchange.id == data["target_id"]))
+        exch = result.scalar_one_or_none()
+        if not exch:
+            await state.clear()
+            return await message.answer("Exchange not found\\.", parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+        exch.api_key = encrypt(data["new_api_key"])
+        exch.api_secret = encrypt(data["new_api_secret"])
+        if data.get("new_api_password"):
+            exch.api_password = encrypt(data["new_api_password"])
+        await db.commit()
+
+    # Clear cached balance for this exchange so the next fetch is fresh
+    from services.cache import _CACHE
+    stale_keys = [k for k in _CACHE if k.startswith("exchange:" + data["new_api_key"][:8])]
+    for k in stale_keys:
+        del _CACHE[k]
+
+    await state.clear()
+    await message.answer(
+        "✅ *" + md(data["target_name"].upper()) + " keys updated\\!*\n\n"
+        "Try *💰 Balances* now to confirm it's working\\.",
+        parse_mode="MarkdownV2", reply_markup=MAIN_MENU,
+    )
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
 
 @router.message(Command("settings"))
 @router.message(F.text == "⚙️ Settings")
@@ -1161,29 +1900,33 @@ async def cmd_settings(message: Message, state: FSMContext):
     await state.clear()
     s = await _load_settings(message.from_user.id)
     if not s:
-        return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
-    await message.answer(_settings_summary(s) + "\nChoose a setting to change:", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+        return await message.answer("Please /start first.")
+    await message.answer(_settings_summary(s) + "\nChoose a setting:", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+
 
 @router.message(F.text == "📊 View My Settings")
-async def cmd_view_settings(message: Message, state: FSMContext):
+async def view_settings(message: Message, state: FSMContext):
     await state.clear()
     s = await _load_settings(message.from_user.id)
     if not s:
-        return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+        return await message.answer("Please /start first.")
     await message.answer(_settings_summary(s), parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
 
+
 @router.message(F.text == "🔙 Back to Menu")
-async def cmd_back_to_menu(message: Message, state: FSMContext):
+async def back_to_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Main menu:", reply_markup=MAIN_MENU)
 
+
 @router.message(F.text == "🔙 Back to Settings")
-async def cmd_back_to_settings(message: Message, state: FSMContext):
+async def back_to_settings(message: Message, state: FSMContext):
     await state.clear()
     s = await _load_settings(message.from_user.id)
     if not s:
-        return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+        return await message.answer("Please /start first.")
     await message.answer(_settings_summary(s) + "\nChoose a setting:", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+
 
 @router.message(Command("notifications"))
 @router.message(F.text == "🔕 Toggle Notifications")
@@ -1192,110 +1935,167 @@ async def cmd_toggle_notifications(message: Message, state: FSMContext):
     async with AsyncSessionLocal() as db:
         user = await get_user_by_telegram_id(db, message.from_user.id)
         if not user:
-            return await message.answer("Please /start first\\.", parse_mode="MarkdownV2")
+            return await message.answer("Please /start first.")
         s = await get_or_create_settings(db, user)
         s.notifications_enabled = not s.notifications_enabled
         await db.commit()
         status = "ON 🔔" if s.notifications_enabled else "OFF 🔕"
-    await message.answer(
-        f"Notifications: *{md(status)}*\n_Checks every 5 minutes, alerts on deposits\\/withdrawals\\._",
-        parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU,
-    )
+    await message.answer(f"Notifications: *{md(status)}*", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+
 
 @router.message(F.text == "💵 Min Balance Filter")
 async def settings_min_balance_prompt(message: Message, state: FSMContext):
     s = await _load_settings(message.from_user.id)
     await state.set_state(Settings.min_balance)
     await message.answer(
-        f"💵 *Minimum balance to display*\n\nCurrent: {fmt_usd(s.min_balance_usd if s else 1.0)}\n\n"
-        "Assets worth less than this are hidden in /balances and /portfolio\\.\n\n"
-        "Enter a USD amount \\(e\\.g\\. `1`, `5`, `10`, or `0` to show everything\\):",
+        f"💵 *Min balance to display*\nCurrent: {fmt_usd(s.min_balance_usd if s else 1.0)}\n\n"
+        "Assets worth less than this are hidden\\. Enter USD \\(e\\.g\\. `1`, `5`, `0` to show all\\):",
         parse_mode="MarkdownV2", reply_markup=cancel_kb(back_to_settings=True),
     )
+
 
 @router.message(Settings.min_balance)
 async def settings_min_balance_save(message: Message, state: FSMContext):
     if message.text in ("🔙 Back to Settings", "❌ Cancel"):
         await state.clear()
-        return await cmd_back_to_settings(message, state)
+        return await back_to_settings(message, state)
     try:
         value = float(message.text.replace("$", "").strip())
-        if value < 0: raise ValueError
+        if value < 0:
+            raise ValueError
     except ValueError:
-        return await message.answer("Enter a valid number e\\.g\\. `1`, `5`, `0`\\.", parse_mode="MarkdownV2")
+        return await message.answer("Enter a valid number e\\.g\\. `1`, `0`\\.", parse_mode="MarkdownV2")
     await _save_setting(message.from_user.id, min_balance_usd=value)
     await state.clear()
-    desc = f"Assets below {fmt_usd(value)} will be hidden" if value > 0 else "All assets will be shown"
-    await message.answer(f"✅ Min balance set to {fmt_usd(value)}\n_{md(desc)}_", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+    await message.answer(f"✅ Min balance set to {fmt_usd(value)}", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+
 
 @router.message(F.text == "🔔 Alert Threshold")
 async def settings_alert_pct_prompt(message: Message, state: FSMContext):
     s = await _load_settings(message.from_user.id)
     await state.set_state(Settings.alert_threshold)
     await message.answer(
-        f"🔔 *Alert threshold \\(%\\)*\n\nCurrent: {md(f'{s.notify_threshold_pct:.1f}' if s else '1.0')}%\n\n"
-        "Alert fires when a balance changes by at least this %\\.\n\n"
-        "`1` sensitive \\| `5` moderate \\| `10` quiet\n\nEnter a %:",
+        f"🔔 *Alert threshold \\(%\\)*\nCurrent: {md(f'{s.notify_threshold_pct:.1f}' if s else '1.0')}%\n\n"
+        "Notify when balance changes by at least this %\\.\n`1` sensitive \\| `5` moderate \\| `10` quiet\n\nEnter %:",
         parse_mode="MarkdownV2", reply_markup=cancel_kb(back_to_settings=True),
     )
+
 
 @router.message(Settings.alert_threshold)
 async def settings_alert_pct_save(message: Message, state: FSMContext):
     if message.text in ("🔙 Back to Settings", "❌ Cancel"):
         await state.clear()
-        return await cmd_back_to_settings(message, state)
+        return await back_to_settings(message, state)
     try:
         value = float(message.text.replace("%", "").strip())
-        if not (0.1 <= value <= 100): raise ValueError
+        if not (0.1 <= value <= 100):
+            raise ValueError
     except ValueError:
         return await message.answer("Enter a number between `0\\.1` and `100`\\.", parse_mode="MarkdownV2")
     await _save_setting(message.from_user.id, notify_threshold_pct=value)
     await state.clear()
     await message.answer(f"✅ Alert threshold: {md(f'{value:.1f}')}%", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
 
+
 @router.message(F.text == "💸 Min Alert Amount")
 async def settings_min_alert_usd_prompt(message: Message, state: FSMContext):
     s = await _load_settings(message.from_user.id)
     await state.set_state(Settings.min_alert_usd)
     await message.answer(
-        f"💸 *Min alert amount \\(USD\\)*\n\nCurrent: {fmt_usd(s.notify_min_usd if s else 1.0)}\n\n"
-        "Alerts only fire when the change is worth at least this in USD\\.\n\n"
-        "`0` any change \\| `1` \\$1\\+ \\| `10` \\$10\\+\n\nEnter a USD amount:",
+        f"💸 *Min alert amount \\(USD\\)*\nCurrent: {fmt_usd(s.notify_min_usd if s else 1.0)}\n\n"
+        "Only alert if the change is worth at least this\\.\n`0` any \\| `1` \\$1\\+ \\| `10` \\$10\\+\n\nEnter USD:",
         parse_mode="MarkdownV2", reply_markup=cancel_kb(back_to_settings=True),
     )
+
 
 @router.message(Settings.min_alert_usd)
 async def settings_min_alert_usd_save(message: Message, state: FSMContext):
     if message.text in ("🔙 Back to Settings", "❌ Cancel"):
         await state.clear()
-        return await cmd_back_to_settings(message, state)
+        return await back_to_settings(message, state)
     try:
         value = float(message.text.replace("$", "").strip())
-        if value < 0: raise ValueError
+        if value < 0:
+            raise ValueError
     except ValueError:
         return await message.answer("Enter a valid amount e\\.g\\. `0`, `1`, `10`\\.", parse_mode="MarkdownV2")
     await _save_setting(message.from_user.id, notify_min_usd=value)
     await state.clear()
-    desc = f"Alerts for moves worth ${value:,.2f}+" if value > 0 else "Alerts for any change"
-    await message.answer(f"✅ Min alert amount: {fmt_usd(value)}\n_{md(desc)}_", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+    await message.answer(f"✅ Min alert amount: {fmt_usd(value)}", parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
 
 
-# ── FIX 5: DB error recovery + Main ──────────────────────────────────────────
+@router.message(F.text == "📅 Digest Settings")
+async def digest_settings_menu(message: Message, state: FSMContext):
+    s = await _load_settings(message.from_user.id)
+    status = f"{s.digest_frequency.capitalize()} digest ON" if s and s.digest_enabled else "Digest OFF"
+    buttons = [
+        [KeyboardButton(text="📅 Daily Digest"), KeyboardButton(text="📅 Weekly Digest")],
+        [KeyboardButton(text="🔕 Disable Digest"), KeyboardButton(text="🔙 Back to Settings")],
+    ]
+    await message.answer(
+        f"📅 *Portfolio Digest*\nCurrent: {md(status)}\n\n"
+        "Receive an automatic portfolio summary at a set frequency\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+    )
+
+
+@router.message(F.text.in_({"📅 Daily Digest", "📅 Weekly Digest", "🔕 Disable Digest"}))
+async def digest_option_save(message: Message, state: FSMContext):
+    if message.text == "📅 Daily Digest":
+        await _save_setting(message.from_user.id, digest_enabled=True, digest_frequency="daily")
+        reply = "✅ Daily digest enabled\\."
+    elif message.text == "📅 Weekly Digest":
+        await _save_setting(message.from_user.id, digest_enabled=True, digest_frequency="weekly")
+        reply = "✅ Weekly digest enabled\\."
+    else:
+        await _save_setting(message.from_user.id, digest_enabled=False)
+        reply = "✅ Digest disabled\\."
+    await message.answer(reply, parse_mode="MarkdownV2", reply_markup=SETTINGS_MENU)
+
+
+# ── Admin panel ───────────────────────────────────────────────────────────────
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Admin only.")
+    await state.clear()
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User))
+        users = result.scalars().all()
+        result2 = await db.execute(select(BalanceLog))
+        log_count = len(result2.scalars().all())
+
+    lines = [
+        "🔧 *Admin Panel*",
+        "",
+        f"👥 Total users: {md(str(len(users)))}",
+        f"📊 BalanceLog rows: {md(str(log_count))}",
+        f"🌐 Server IP: `{md(get_server_ip() or 'not detected')}`",
+        "",
+    ]
+    for u in users:
+        w_count = len(u.wallets)
+        e_count = len(u.exchanges)
+        name = u.username or u.first_name or str(u.telegram_id)
+        lines.append(f"• {md(name)} — {w_count} wallets, {e_count} exchanges")
+
+    await message.answer("\n".join(lines), parse_mode="MarkdownV2", reply_markup=MAIN_MENU)
+
+
+# ── Health endpoint (for uptime monitoring / Render port detection) ──────────
+
+async def health_handler(request):
+    return web.Response(text='{"status":"ok"}', content_type="application/json")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def _run_health_server(port: int):
-    """
-    Minimal HTTP server so Render/Railway detect an open port.
-    Render Web Service requires a bound port — without this it kills the process.
-    GET / or GET /health → 200 {"status":"ok"}
-    """
-    async def health(request):
-        return web.Response(
-            text='{"status":"ok","bot":"running"}',
-            content_type="application/json",
-        )
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -1304,19 +2104,32 @@ async def _run_health_server(port: int):
 
 
 async def main():
+    global _SERVER_PUBLIC_IP
+
+    # ── Health server FIRST — Render kills the process if no port binds quickly ──
+    port = int(os.environ.get("PORT", "8080"))
+    await _run_health_server(port)
+
+    # ── Detect server public IP (for exchange IP whitelisting guides) ────────
+    _SERVER_PUBLIC_IP = await _detect_server_ip()
+    if _SERVER_PUBLIC_IP:
+        log.info(f"Server public IP detected: {_SERVER_PUBLIC_IP}")
+    else:
+        log.warning("Could not detect server public IP — set SERVER_IP in .env manually if exchanges need it")
+
     # ── Database ────────────────────────────────────────────────────────────
     try:
         await init_db()
         log.info("Database tables ready.")
     except Exception as e:
         log.error(
-            f"\n\n{'='*60}\n"
-            f"DATABASE CONNECTION FAILED\n"
+            "\n\n" + "=" * 60 + "\n"
+            "DATABASE CONNECTION FAILED\n"
             f"Error: {e}\n\n"
-            f"Check DATABASE_URL in .env / Render env vars\n"
-            f"  PostgreSQL: postgresql+asyncpg://user:pass@host/db\n"
-            f"  SQLite:     sqlite+aiosqlite:///./portfolio.db\n"
-            f"{'='*60}\n"
+            "Check DATABASE_URL in .env / Render env vars\n"
+            "  PostgreSQL: postgresql+asyncpg://user:pass@host/db\n"
+            "  SQLite:     sqlite+aiosqlite:///./portfolio.db\n"
+            + "=" * 60 + "\n"
         )
         raise SystemExit(1)
 
@@ -1326,20 +2139,19 @@ async def main():
         poll_and_notify, "interval",
         seconds=config.POLL_INTERVAL_SECONDS,
         args=[bot], id="notify_poll",
-        replace_existing=True,
-        misfire_grace_time=60,
-        max_instances=1,
-        coalesce=True,
+        replace_existing=True, misfire_grace_time=60,
+        max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        send_digest, "interval",
+        hours=1, args=[bot], id="digest",
+        replace_existing=True, misfire_grace_time=300,
+        max_instances=1, coalesce=True,
     )
     scheduler.start()
     log.info(f"Scheduler started — polling every {config.POLL_INTERVAL_SECONDS}s")
 
-    # ── Health server (required for Render Web Service) ─────────────────────
-    # Render injects PORT automatically. Default 8080 for local dev.
-    port = int(os.environ.get("PORT", "8080"))
-    await _run_health_server(port)
-
-    # ── Telegram bot (long-polling) ─────────────────────────────────────────
+    # ── Telegram bot (long-polling) ────────────────────────────────────────
     log.info("Bot starting… (use /cancel any time to exit a flow)")
     await dp.start_polling(bot, skip_updates=True)
 

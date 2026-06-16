@@ -1,5 +1,5 @@
 """
-db.py — fully async SQLAlchemy 2.0 + asyncpg
+db.py — async SQLAlchemy 2.0 + asyncpg models
 """
 import ssl
 from datetime import datetime
@@ -8,14 +8,11 @@ from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Float,
     ForeignKey, Integer, String, UniqueConstraint, select, text,
 )
-from sqlalchemy.ext.asyncio import (
-    AsyncSession, async_sessionmaker, create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 from config import DATABASE_URL, IS_POSTGRES
 
-# ── Engine ────────────────────────────────────────────────────────────────────
 _engine_kwargs: dict = {"echo": False}
 if IS_POSTGRES:
     _ssl_ctx = ssl.create_default_context()
@@ -31,17 +28,17 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
-
 class UserSettings(Base):
     __tablename__ = "user_settings"
 
     id                    = Column(Integer,  primary_key=True, index=True)
     user_id               = Column(Integer,  ForeignKey("users.id"), unique=True, nullable=False)
-    min_balance_usd       = Column(Float,    default=1.0,  nullable=False)
-    notify_threshold_pct  = Column(Float,    default=1.0,  nullable=False)
-    notify_min_usd        = Column(Float,    default=1.0,  nullable=False)
-    notifications_enabled = Column(Boolean,  default=True, nullable=False)
+    min_balance_usd       = Column(Float,    default=1.0,   nullable=False)
+    notify_threshold_pct  = Column(Float,    default=1.0,   nullable=False)
+    notify_min_usd        = Column(Float,    default=1.0,   nullable=False)
+    notifications_enabled = Column(Boolean,  default=True,  nullable=False)
+    digest_enabled        = Column(Boolean,  default=False, nullable=False)
+    digest_frequency      = Column(String(8),default="daily", nullable=False)
     updated_at            = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="settings")
@@ -60,8 +57,8 @@ class User(Base):
     wallets   = relationship("Wallet",       back_populates="user", cascade="all, delete", lazy="selectin")
     exchanges = relationship("Exchange",     back_populates="user", cascade="all, delete", lazy="selectin")
     logs      = relationship("BalanceLog",   back_populates="user", cascade="all, delete", lazy="selectin")
-    settings  = relationship("UserSettings", back_populates="user", cascade="all, delete",
-                             lazy="selectin", uselist=False)
+    settings  = relationship("UserSettings", back_populates="user", cascade="all, delete", lazy="selectin", uselist=False)
+    alerts    = relationship("PriceAlert",   back_populates="user", cascade="all, delete", lazy="selectin")
 
 
 class Wallet(Base):
@@ -75,7 +72,7 @@ class Wallet(Base):
     label    = Column(String(64),  nullable=True)
     added_at = Column(DateTime, default=datetime.utcnow)
 
-    user = relationship("User",     back_populates="wallets")
+    user = relationship("User", back_populates="wallets")
     logs = relationship("BalanceLog", back_populates="wallet", cascade="all, delete", lazy="selectin")
 
 
@@ -92,7 +89,7 @@ class Exchange(Base):
     api_password = Column(String(512), nullable=True)
     added_at     = Column(DateTime, default=datetime.utcnow)
 
-    user = relationship("User",     back_populates="exchanges")
+    user = relationship("User", back_populates="exchanges")
     logs = relationship("BalanceLog", back_populates="exchange", cascade="all, delete", lazy="selectin")
 
 
@@ -113,7 +110,19 @@ class BalanceLog(Base):
     exchange = relationship("Exchange", back_populates="logs")
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+class PriceAlert(Base):
+    __tablename__ = "price_alerts"
+
+    id         = Column(Integer,    primary_key=True, index=True)
+    user_id    = Column(Integer,    ForeignKey("users.id"), nullable=False)
+    asset      = Column(String(16), nullable=False)
+    direction  = Column(String(5),  nullable=False)
+    target_usd = Column(Float,      nullable=False)
+    triggered  = Column(Boolean,    default=False)
+    created_at = Column(DateTime,   default=datetime.utcnow)
+
+    user = relationship("User", back_populates="alerts")
+
 
 async def get_user_by_telegram_id(db: AsyncSession, telegram_id: int) -> User | None:
     result = await db.execute(select(User).where(User.telegram_id == telegram_id))
@@ -152,22 +161,12 @@ async def get_or_create_settings(db: AsyncSession, user: User) -> UserSettings:
 
 async def get_wallet_exists(db: AsyncSession, user_id: int, chain: str, address: str) -> bool:
     result = await db.execute(
-        select(Wallet).where(
-            Wallet.user_id == user_id,
-            Wallet.chain   == chain,
-            Wallet.address == address,
-        )
+        select(Wallet).where(Wallet.user_id == user_id, Wallet.chain == chain, Wallet.address == address)
     )
     return result.scalar_one_or_none() is not None
 
 
 def group_wallets_by_address(wallets: list) -> dict[str, dict]:
-    """
-    Group Wallet ORM rows by address so we can show:
-      0xABC…  [Ethereum, BNB, Polygon]  "My main wallet"
-
-    Returns: {address: {"label": str|None, "chains": [chain_str], "ids": [wallet_id]}}
-    """
     groups: dict[str, dict] = {}
     for w in wallets:
         addr = w.address
@@ -175,10 +174,28 @@ def group_wallets_by_address(wallets: list) -> dict[str, dict]:
             groups[addr] = {"label": w.label, "chains": [], "ids": [], "added_at": w.added_at}
         groups[addr]["chains"].append(w.chain)
         groups[addr]["ids"].append(w.id)
-        # Use the most recent label (in case they differ per chain row)
         if w.label:
             groups[addr]["label"] = w.label
     return groups
+
+
+async def prune_balance_logs(db: AsyncSession, retention_days: int = 30) -> int:
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    if IS_POSTGRES:
+        result = await db.execute(
+            text("DELETE FROM balance_logs WHERE recorded_at < :cutoff RETURNING id"),
+            {"cutoff": cutoff}
+        )
+        deleted = len(result.fetchall())
+    else:
+        result = await db.execute(
+            text("DELETE FROM balance_logs WHERE recorded_at < :cutoff"),
+            {"cutoff": cutoff}
+        )
+        deleted = result.rowcount
+    await db.commit()
+    return deleted
 
 
 async def init_db() -> None:
@@ -187,6 +204,8 @@ async def init_db() -> None:
         if IS_POSTGRES:
             for stmt in [
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS digest_frequency VARCHAR(8) DEFAULT 'daily'",
             ]:
                 try:
                     await conn.execute(text(stmt))
