@@ -100,6 +100,11 @@ def _merge_balances(raw: dict[str, float]) -> dict[str, float]:
 
 # ── Per-exchange fetch strategies ─────────────────────────────────────────────
 
+class GeoBlockedError(Exception):
+    """Raised when an exchange returns HTTP 451 — regional block, not fixable by IP whitelisting."""
+    pass
+
+
 async def _fetch_binance(exchange: ccxt.Exchange) -> dict[str, float]:
     """
     Binance safe fetch for cloud IPs.
@@ -112,10 +117,17 @@ async def _fetch_binance(exchange: ccxt.Exchange) -> dict[str, float]:
       /sapi/v1/capital/config/getall   — IP-restricted on cloud providers
       /sapi/v1/lending/union/account   — deprecated (405)
       cross_margin                     — requires capital/config
+
+    Note: Binance returns HTTP 451 ("Service unavailable from a restricted
+    location") for entire hosting regions (AWS/GCP/Azure/Render datacenters
+    in the US and elsewhere). This is a full geo-block applied before
+    authentication and CANNOT be fixed by IP whitelisting on the API key.
     """
     totals: dict[str, float] = {}
+    geo_blocked = False
 
     async def _safe(params: dict, label: str) -> None:
+        nonlocal geo_blocked
         try:
             raw = await exchange.fetch_balance(params=params)
             count = 0
@@ -127,7 +139,10 @@ async def _fetch_binance(exchange: ccxt.Exchange) -> dict[str, float]:
                 log.info(f"[binance] {label}: {count} assets")
         except Exception as exc:
             msg = str(exc)
-            if any(x in msg for x in ["403", "405", "capital/config", "deprecated", "query-info"]):
+            if "451" in msg or "restricted location" in msg.lower():
+                geo_blocked = True
+                log.warning(f"[binance] {label}: geo-blocked (451) — hosting region blocked by Binance")
+            elif any(x in msg for x in ["403", "405", "capital/config", "deprecated", "query-info"]):
                 log.debug(f"[binance] {label} skipped (cloud IP restricted or deprecated)")
             else:
                 log.warning(f"[binance] {label} failed: {msg[:120]}")
@@ -136,34 +151,50 @@ async def _fetch_binance(exchange: ccxt.Exchange) -> dict[str, float]:
         _safe({},                  "spot+earn"),
         _safe({"type": "funding"}, "funding"),
     )
+
+    if geo_blocked and not totals:
+        raise GeoBlockedError(
+            "Binance has geo-blocked this server's hosting region (HTTP 451). "
+            "This cannot be fixed by IP whitelisting — Binance blocks the entire "
+            "datacenter, not just your key. Try a VPS in a non-blocked region "
+            "(e.g. outside the US), or use a different exchange."
+        )
+
     return totals
 
 
 async def _fetch_bybit(exchange: ccxt.Exchange) -> dict[str, float]:
     """
     Bybit safe fetch.
-    /v5/asset/coin/query-info is blocked on cloud IPs → use unified account.
-    Falls back to spot if unified returns nothing.
+    /v5/asset/coin/query-info is blocked on cloud IPs -> use unified account.
+    Tries both unified and spot account types since funds may be in either.
     """
     totals: dict[str, float] = {}
+    last_error: str | None = None
+    any_success = False
 
     for acct_type, label in [("unified", "unified"), ("spot", "spot")]:
         try:
             raw = await exchange.fetch_balance(params={"type": acct_type})
+            any_success = True
             count = 0
             for asset, amount in raw.get("total", {}).items():
                 if amount and amount > 0:
                     totals[asset] = totals.get(asset, 0) + amount
                     count += 1
-            if count:
-                log.info(f"[bybit] {label}: {count} assets")
-                break   # unified worked — no need for spot
+            log.info(f"[bybit] {label}: {count} assets")
         except Exception as exc:
             msg = str(exc)
+            last_error = msg[:150]
             if "403" in msg or "query-info" in msg:
-                log.debug(f"[bybit] {label} skipped (cloud IP restricted)")
+                log.debug(f"[bybit] {label} skipped (cloud IP restricted): {msg[:100]}")
             else:
                 log.warning(f"[bybit] {label} failed: {msg[:120]}")
+
+    # If every account type failed outright (not just empty), surface the error
+    # instead of silently returning {} -> "No balances found"
+    if not any_success and last_error:
+        raise ccxt.ExchangeError(f"All account types failed: {last_error}")
 
     return totals
 
@@ -280,6 +311,11 @@ async def get_exchange_balance(
         cache_set("exchange", cache_key, result)
         return result
 
+    except GeoBlockedError as exc:
+        return {
+            "exchange": exchange_id, "balances": [],
+            "error": str(exc),
+        }
     except ccxt.AuthenticationError as exc:
         return {
             "exchange": exchange_id, "balances": [],
