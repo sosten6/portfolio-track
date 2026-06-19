@@ -285,9 +285,19 @@ async def get_exchange_balance(
 
         for attempt in range(3):
             try:
-                raw_totals = await _fetch_all(exchange, exchange_id)
+                # Hard outer timeout — prevents a hung/leaked socket from
+                # blocking the whole bot indefinitely (seen on Render free
+                # tier after Binance 451 errors leave sessions half-open).
+                raw_totals = await asyncio.wait_for(
+                    _fetch_all(exchange, exchange_id), timeout=15.0
+                )
                 last_err = None
                 break
+            except asyncio.TimeoutError as exc:
+                last_err = exc
+                log.warning(f"[{exchange_id}] fetch timed out after 15s (attempt {attempt + 1}/3)")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
             except ccxt.NetworkError as exc:
                 last_err = exc
                 if attempt < 2:
@@ -336,8 +346,8 @@ async def get_exchange_balance(
     finally:
         if exchange:
             try:
-                await exchange.close()
-            except Exception:
+                await asyncio.wait_for(exchange.close(), timeout=5.0)
+            except (Exception, asyncio.TimeoutError):
                 pass
 
 
