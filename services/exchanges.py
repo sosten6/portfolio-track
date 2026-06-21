@@ -167,37 +167,22 @@ async def _fetch_bybit(exchange: ccxt.Exchange) -> dict[str, float]:
     """
     Bybit safe fetch.
     /v5/asset/coin/query-info is blocked on cloud IPs -> use unified account.
-
-    IMPORTANT: unified and spot are NOT separate pools on a UTA (Unified
-    Trading Account) -- spot is just a view into the same unified balance.
-    Querying both and summing them double-counts every asset. We try
-    account types in priority order and STOP at the first one that
-    returns any non-zero balance, instead of summing across all of them.
-
-    Also try "funding" as a fallback for older/non-UTA accounts where
-    funds sit in the funding wallet rather than spot/unified.
+    Tries both unified and spot account types since funds may be in either.
     """
     totals: dict[str, float] = {}
     last_error: str | None = None
     any_success = False
 
-    for acct_type, label in [("unified", "unified"), ("spot", "spot"), ("funding", "funding")]:
+    for acct_type, label in [("unified", "unified"), ("spot", "spot")]:
         try:
             raw = await exchange.fetch_balance(params={"type": acct_type})
             any_success = True
             count = 0
-            attempt_totals: dict[str, float] = {}
             for asset, amount in raw.get("total", {}).items():
                 if amount and amount > 0:
-                    attempt_totals[asset] = amount
+                    totals[asset] = totals.get(asset, 0) + amount
                     count += 1
             log.info(f"[bybit] {label}: {count} assets")
-            if count > 0:
-                # Found real balances -- use this account type and stop.
-                # Do NOT continue to other types, which would double-count
-                # on UTA accounts where spot/unified mirror each other.
-                totals = attempt_totals
-                break
         except Exception as exc:
             msg = str(exc)
             last_error = msg[:150]
