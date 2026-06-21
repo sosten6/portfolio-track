@@ -54,9 +54,15 @@ class User(Base):
     joined_at     = Column(DateTime, default=datetime.utcnow)
     notifications = Column(Boolean,  default=True)
 
+    # NOTE: logs intentionally NOT eager-loaded (lazy="selectin" removed).
+    # BalanceLog grows unboundedly and was never accessed via this relationship
+    # anywhere in the codebase -- /history and /pnl query BalanceLog directly
+    # via select(). Eager-loading it here was silently transferring the user's
+    # entire balance history on every single User fetch (every command, every
+    # poll cycle), which is what exhausted the Neon free-tier data transfer quota.
     wallets   = relationship("Wallet",       back_populates="user", cascade="all, delete", lazy="selectin")
     exchanges = relationship("Exchange",     back_populates="user", cascade="all, delete", lazy="selectin")
-    logs      = relationship("BalanceLog",   back_populates="user", cascade="all, delete", lazy="selectin")
+    logs      = relationship("BalanceLog",   back_populates="user", cascade="all, delete", lazy="select")
     settings  = relationship("UserSettings", back_populates="user", cascade="all, delete", lazy="selectin", uselist=False)
     alerts    = relationship("PriceAlert",   back_populates="user", cascade="all, delete", lazy="selectin")
 
@@ -73,7 +79,7 @@ class Wallet(Base):
     added_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="wallets")
-    logs = relationship("BalanceLog", back_populates="wallet", cascade="all, delete", lazy="selectin")
+    logs = relationship("BalanceLog", back_populates="wallet", cascade="all, delete", lazy="select")  # not eager-loaded, see User.logs note
 
 
 class Exchange(Base):
@@ -90,7 +96,7 @@ class Exchange(Base):
     added_at     = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="exchanges")
-    logs = relationship("BalanceLog", back_populates="exchange", cascade="all, delete", lazy="selectin")
+    logs = relationship("BalanceLog", back_populates="exchange", cascade="all, delete", lazy="select")  # not eager-loaded, see User.logs note
 
 
 class BalanceLog(Base):
