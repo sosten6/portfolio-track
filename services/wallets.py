@@ -2,6 +2,7 @@
 services/wallets.py — multi-chain balance fetching
 """
 import asyncio
+import os
 import aiohttp
 from web3 import Web3
 import config
@@ -37,6 +38,12 @@ def detect_address_type(address: str) -> str:
 
 
 async def _get_evm_balance(rpc_url: str, address: str) -> float:
+    # If rpc_url contains a placeholder (empty key), rebuild it with the live env var
+    api_key = os.environ.get("ALCHEMY_API_KEY", "") or config.ALCHEMY_API_KEY
+    if "alchemy.com/v2/" in rpc_url and api_key:
+        # Ensure the key in the URL is the current live value, not a stale import-time value
+        base = rpc_url.split("/v2/")[0]
+        rpc_url = f"{base}/v2/{api_key}"
     loop = asyncio.get_event_loop()
     def _fetch():
         w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": RPC_TIMEOUT}))
@@ -47,14 +54,16 @@ async def _get_evm_balance(rpc_url: str, address: str) -> float:
 
 
 async def _get_erc20_tokens(chain: str, address: str) -> list[dict]:
-    if not config.ALCHEMY_API_KEY:
+    # Read key at call time (not import time) so Railway env vars are always fresh
+    api_key = os.environ.get("ALCHEMY_API_KEY", "") or config.ALCHEMY_API_KEY
+    if not api_key:
         return []
     alchemy_networks = {
-        "ethereum": f"eth-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
-        "polygon":  f"polygon-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
-        "arbitrum": f"arb-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
-        "optimism": f"opt-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
-        "base":     f"base-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
+        "ethereum": f"eth-mainnet.g.alchemy.com/v2/{api_key}",
+        "polygon":  f"polygon-mainnet.g.alchemy.com/v2/{api_key}",
+        "arbitrum": f"arb-mainnet.g.alchemy.com/v2/{api_key}",
+        "optimism": f"opt-mainnet.g.alchemy.com/v2/{api_key}",
+        "base":     f"base-mainnet.g.alchemy.com/v2/{api_key}",
     }
     network = alchemy_networks.get(chain)
     if not network:
