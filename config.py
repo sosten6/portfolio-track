@@ -41,19 +41,35 @@ SERVER_IP: str = _clean(os.getenv("SERVER_IP", ""))
 # ── Blockchain RPCs ───────────────────────────────────────────────────────────
 ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
 
+# Use Alchemy for chains it supports (ETH, Polygon, Arbitrum, Optimism, Base)
+# Fall back to public RPCs for BNB, Avalanche, Solana, Bitcoin which Alchemy
+# doesn't support or aren't needed for ERC-20 token detection.
+_alchemy = f"https://{{network}}.g.alchemy.com/v2/{ALCHEMY_API_KEY}" if ALCHEMY_API_KEY else ""
+
 ETH_RPC_URL: str = os.getenv(
     "ETH_RPC_URL",
-    f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
-    if ALCHEMY_API_KEY else "https://cloudflare-eth.com",
+    _alchemy.format(network="eth-mainnet") if _alchemy else "https://cloudflare-eth.com",
 )
-BNB_RPC_URL: str      = os.getenv("BNB_RPC_URL",      "https://bsc-dataseed1.binance.org/")
-POLYGON_RPC_URL: str  = os.getenv("POLYGON_RPC_URL",  "https://polygon-rpc.com/")
-ARBITRUM_RPC_URL: str = os.getenv("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc")
-OPTIMISM_RPC_URL: str = os.getenv("OPTIMISM_RPC_URL", "https://mainnet.optimism.io")
-BASE_RPC_URL: str     = os.getenv("BASE_RPC_URL",     "https://mainnet.base.org")
-AVAX_RPC_URL: str     = os.getenv("AVAX_RPC_URL",     "https://api.avax.network/ext/bc/C/rpc")
-SOLANA_RPC_URL: str   = os.getenv("SOLANA_RPC_URL",   "https://api.mainnet-beta.solana.com")
-BITCOIN_API_URL: str  = "https://blockstream.info/api"
+POLYGON_RPC_URL: str = os.getenv(
+    "POLYGON_RPC_URL",
+    _alchemy.format(network="polygon-mainnet") if _alchemy else "https://polygon-rpc.com/",
+)
+ARBITRUM_RPC_URL: str = os.getenv(
+    "ARBITRUM_RPC_URL",
+    _alchemy.format(network="arb-mainnet") if _alchemy else "https://arb1.arbitrum.io/rpc",
+)
+OPTIMISM_RPC_URL: str = os.getenv(
+    "OPTIMISM_RPC_URL",
+    _alchemy.format(network="opt-mainnet") if _alchemy else "https://mainnet.optimism.io",
+)
+BASE_RPC_URL: str = os.getenv(
+    "BASE_RPC_URL",
+    _alchemy.format(network="base-mainnet") if _alchemy else "https://mainnet.base.org",
+)
+BNB_RPC_URL: str    = os.getenv("BNB_RPC_URL",    "https://bsc-dataseed1.binance.org/")
+AVAX_RPC_URL: str   = os.getenv("AVAX_RPC_URL",   "https://api.avax.network/ext/bc/C/rpc")
+SOLANA_RPC_URL: str = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+BITCOIN_API_URL: str = "https://blockstream.info/api"
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def _fix_db_url(url: str) -> str:
