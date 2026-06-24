@@ -200,4 +200,8 @@ MIT — do whatever you want with it.
 
 ## 🤝 Contributing
 
+<<<<<<< HEAD
 PRs welcome. If you add support for a new chain or exchange, open a pull request.
+=======
+PRs welcome. If you add support for a new chain or exchange, open a pull request.
+>>>>>>> 6f50e133ff65b2c65c783115381891b072738b03
