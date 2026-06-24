@@ -4,6 +4,7 @@ A self-hosted Telegram bot that tracks your crypto portfolio across **9 blockcha
 
 Your API keys never leave your server. Everything is encrypted at rest.
 
+🤖 **Live demo:** [@portfoliomanage_track_bot](https://t.me/portfoliomanage_track_bot)
 ---
 
 ## ✨ Features
@@ -79,8 +80,8 @@ Your API keys never leave your server. Everything is encrypted at rest.
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/yourusername/crypto-portfolio-bot.git
-cd crypto-portfolio-bot
+git clone https://github.com/sosten6/portfolio-track.git
+cd portfolio-track
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
